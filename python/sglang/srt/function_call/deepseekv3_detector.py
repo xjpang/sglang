@@ -32,6 +32,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
         self._last_arguments = ""
         self.current_tool_id = -1
+        self.begin_tool_call = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -81,12 +82,18 @@ class DeepSeekV3Detector(BaseFormatDetector):
             self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
         )
 
+        if not self.begin_tool_call:
+            self.begin_tool_call = has_tool_call
+
         if not has_tool_call:
             self._buffer = ""
-            for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
+            for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
                 if e_token in new_text:
                     new_text = new_text.replace(e_token, "")
+            if self.begin_tool_call:  # the last ``` after function calling should be removed.
+                new_text = new_text.replace("```", "")
             return StreamingParseResult(normal_text=new_text)
+
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = {
