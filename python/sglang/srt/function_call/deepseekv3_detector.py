@@ -32,6 +32,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
         self._last_arguments = ""
         self.current_tool_id = -1
+        self.begin_tool_call = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -67,6 +68,16 @@ class DeepSeekV3Detector(BaseFormatDetector):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
+    def process_content_before_bot_token(self, content: str):
+        index = content.find(self.bot_token)
+
+        if index > 0:
+            prefix = content[:index]
+            context = content[index:]
+            return prefix, context
+
+        return None, content
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
@@ -81,12 +92,24 @@ class DeepSeekV3Detector(BaseFormatDetector):
             self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
         )
 
+        if not self.begin_tool_call:
+            self.begin_tool_call = has_tool_call
+
         if not has_tool_call:
             self._buffer = ""
-            for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
+            for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
                 if e_token in new_text:
                     new_text = new_text.replace(e_token, "")
+            if self.begin_tool_call:  # the last ``` after function calling should be removed.
+                new_text = new_text.replace("```", "")
             return StreamingParseResult(normal_text=new_text)
+
+        # when speculate decode enabled, input could be like: xxx <｜tool▁calls▁begin｜>
+        # we should put xxx to normal_text
+        normal_text, current_text = self.process_content_before_bot_token(current_text)
+        self._buffer = current_text
+        if normal_text:
+            return StreamingParseResult(normal_text=normal_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = {
@@ -102,9 +125,12 @@ class DeepSeekV3Detector(BaseFormatDetector):
                 string=current_text,
                 flags=re.DOTALL,
             )
-            if partial_match:
+
+            if partial_match and not current_text.endswith("\n"):
                 func_name = partial_match.group(2).strip()
-                func_args_raw = partial_match.group(3).strip()
+                group3_text = partial_match.group(3).strip()
+                group3_text_list = group3_text.split("\n```", 1)
+                func_args_raw = group3_text_list[0]
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -134,7 +160,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
                     }
                 else:
                     argument_diff = (
-                        func_args_raw[len(self._last_arguments) :]
+                        func_args_raw[len(self._last_arguments):]
                         if func_args_raw.startswith(self._last_arguments)
                         else func_args_raw
                     )
@@ -171,7 +197,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         )
                         if match:
                             # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[match.end() :]
+                            self._buffer = current_text[match.end():]
                         else:
                             self._buffer = ""
 
