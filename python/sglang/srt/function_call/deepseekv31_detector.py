@@ -108,6 +108,17 @@ class DeepSeekV31Detector(BaseFormatDetector):
                     new_text = new_text.replace(e_token, "")
             return StreamingParseResult(normal_text=new_text)
 
+        # 在self.bot_token前可能会有其他内容，在mtp场景下会丢失，这里需要做个处理
+        # 如果在current_text中包含self.bot_token，且在self.bot_token前有内容，将该内容做为normal_text返回，并从current_text中去除
+        bot_token_pos = current_text.find(self.bot_token)
+        if bot_token_pos > 0:
+            # 提取bot_token前的内容作为normal_text
+            normal_text = current_text[:bot_token_pos]
+            # 从current_text中移除前面的内容，保留bot_token及其后的内容
+            current_text = current_text[bot_token_pos:]
+            self._buffer = current_text
+            return StreamingParseResult(normal_text=normal_text)
+
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
