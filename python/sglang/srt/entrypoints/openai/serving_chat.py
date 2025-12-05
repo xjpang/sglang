@@ -171,6 +171,14 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        # When reasoning_parser is enabled at server level but enable_thinking is False
+        # in the request, skip delayed constraint decoding so grammar constraints
+        # are applied immediately (the model won't output </think> token)
+        if self.reasoning_parser and not self._get_enable_thinking_from_request(
+            request
+        ):
+            sampling_params["skip_delay_decoding"] = True
+
         # Handle single vs multiple requests
         if is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}

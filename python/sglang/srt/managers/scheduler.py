@@ -1429,6 +1429,16 @@ class Scheduler(
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+
+                # If skip_delay_decoding is True and we have a ReasonerGrammarObject,
+                # set is_in_reasoning=False to skip delayed decoding (apply constraints immediately)
+                if (
+                    req.sampling_params.skip_delay_decoding
+                    and cache_hit
+                    and hasattr(value, "is_in_reasoning")
+                ):
+                    value.is_in_reasoning = False
+
                 req.grammar = value
 
                 if not cache_hit:
@@ -2138,6 +2148,13 @@ class Scheduler(
                     error_msg = f"Invalid grammar request: {req.grammar_key=}"
                     req.set_finish_with_abort(error_msg)
 
+                # If skip_delay_decoding is True and we have a ReasonerGrammarObject,
+                # set is_in_reasoning=False to skip delayed decoding
+                if req.sampling_params.skip_delay_decoding and hasattr(
+                    req.grammar, "is_in_reasoning"
+                ):
+                    req.grammar.is_in_reasoning = False
+
                 num_ready_reqs += 1
             except futures._base.TimeoutError:
                 req.grammar_wait_ct += 1
@@ -2171,6 +2188,13 @@ class Scheduler(
                 if req.grammar is INVALID_GRAMMAR_OBJ:
                     error_msg = f"Invalid grammar request: {req.grammar_key=}"
                     req.set_finish_with_abort(error_msg)
+
+                # If skip_delay_decoding is True and we have a ReasonerGrammarObject,
+                # set is_in_reasoning=False to skip delayed decoding
+                if req.sampling_params.skip_delay_decoding and hasattr(
+                    req.grammar, "is_in_reasoning"
+                ):
+                    req.grammar.is_in_reasoning = False
         else:
             num_ready_reqs_max = num_ready_reqs
             num_timeout_reqs_max = num_timeout_reqs
