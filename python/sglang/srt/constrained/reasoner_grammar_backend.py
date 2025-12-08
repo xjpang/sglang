@@ -34,6 +34,16 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # +     means number of tokens after thinking ended
         self.tokens_after_think_end = -1
 
+    def skip_thinking_state(self):
+        """Skip the thinking state and immediately enter constrained decoding mode.
+
+        This is useful for models like Qwen3 that support enable_thinking parameter.
+        When thinking is disabled via request parameters, the model won't generate
+        <think>...</think> tokens, so we should skip waiting for </think> and
+        start constrained decoding immediately.
+        """
+        self.tokens_after_think_end = 0
+
     def transfer_state(self, token: int) -> int:
         if self.tokens_after_think_end == -1 and token == self.think_end_id:
             self.tokens_after_think_end = 0

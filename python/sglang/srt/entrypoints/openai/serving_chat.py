@@ -171,6 +171,14 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        # For models that support enable_thinking (e.g., Qwen3), if thinking is disabled
+        # via chat_template_kwargs, we should skip the reasoner grammar wrapper to avoid
+        # waiting indefinitely for the </think> token that will never come.
+        if self.reasoning_parser and not self._get_enable_thinking_from_request(
+            request
+        ):
+            sampling_params["skip_reasoner_grammar"] = True
+
         # Handle single vs multiple requests
         if is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}

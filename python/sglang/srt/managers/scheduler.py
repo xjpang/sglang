@@ -40,6 +40,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
+from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -1272,6 +1273,21 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+    def _maybe_skip_reasoner_grammar(self, req: Req):
+        """Skip the reasoner grammar waiting state if skip_reasoner_grammar is set.
+
+        For models like Qwen3 that support enable_thinking parameter, when thinking
+        is disabled via request parameters, the model won't generate <think>...</think>
+        tokens. In this case, we should skip waiting for </think> and start
+        constrained decoding immediately.
+        """
+        if (
+            getattr(req.sampling_params, "skip_reasoner_grammar", False)
+            and req.grammar is not None
+            and isinstance(req.grammar, ReasonerGrammarObject)
+        ):
+            req.grammar.skip_thinking_state()
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1441,6 +1457,10 @@ class Scheduler(
                     if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
                         error_msg = f"Invalid grammar request with cache hit: {key=}"
                         req.set_finish_with_abort(error_msg)
+                    else:
+                        # For models like Qwen3 that support enable_thinking parameter,
+                        # if thinking is disabled, skip the reasoner grammar waiting state
+                        self._maybe_skip_reasoner_grammar(req)
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -2188,6 +2208,10 @@ class Scheduler(
         num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
 
         for req in self.grammar_queue[:num_ready_reqs]:
+            # For models like Qwen3 that support enable_thinking parameter,
+            # if thinking is disabled, skip the reasoner grammar waiting state
+            if req.grammar is not None and req.grammar is not INVALID_GRAMMAR_OBJ:
+                self._maybe_skip_reasoner_grammar(req)
             self._add_request_to_queue(req)
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
