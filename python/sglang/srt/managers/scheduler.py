@@ -1432,6 +1432,11 @@ class Scheduler(
 
                 # If skip_delay_decoding is True and we have a ReasonerGrammarObject,
                 # set is_in_reasoning=False to skip delayed decoding (apply constraints immediately)
+                logger.info(
+                    f"jimpang 3 skip_delay_decoding={req.sampling_params.skip_delay_decoding}, "
+                    f"cache_hit={cache_hit}, "
+                    f"has_is_in_reasoning={hasattr(value, 'is_in_reasoning')}"
+                )
                 if (
                     req.sampling_params.skip_delay_decoding
                     and cache_hit
@@ -2145,15 +2150,16 @@ class Scheduler(
 
                 req.grammar = req.grammar.result(timeout=0.03)
                 self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                logger.info(
+                    f"jimpang 4: skip_delay_decoding={req.sampling_params.skip_delay_decoding}, "
+                    f"has_is_in_reasoning={hasattr(req.grammar, 'is_in_reasoning')}"
+                )
                 if req.grammar is INVALID_GRAMMAR_OBJ:
                     error_msg = f"Invalid grammar request: {req.grammar_key=}"
                     req.set_finish_with_abort(error_msg)
 
-                # If skip_delay_decoding is True and we have a ReasonerGrammarObject,
-                # set is_in_reasoning=False to skip delayed decoding
-                if req.sampling_params.skip_delay_decoding and hasattr(
-                    req.grammar, "is_in_reasoning"
-                ):
+                    # If skip_delay_decoding is True and we have a ReasonerGrammarObject,
+                    # set is_in_reasoning=False to skip delayed decoding
                     logger.info(f"jimpang 4 ...........")
                     req.grammar.is_in_reasoning = False
 
@@ -2193,6 +2199,10 @@ class Scheduler(
 
                 # If skip_delay_decoding is True and we have a ReasonerGrammarObject,
                 # set is_in_reasoning=False to skip delayed decoding
+                logger.info(
+                    f"jimpang 2: skip_delay_decoding={req.sampling_params.skip_delay_decoding}, "
+                    f"has_is_in_reasoning={hasattr(req.grammar, 'is_in_reasoning')}"
+                )
                 if req.sampling_params.skip_delay_decoding and hasattr(
                     req.grammar, "is_in_reasoning"
                 ):
