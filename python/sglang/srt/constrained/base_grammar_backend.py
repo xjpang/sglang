@@ -248,6 +248,7 @@ def create_grammar_backend(
             ReasonerGrammarBackend,
         )
 
+        logger.info(f"jimpang tokenizer.think_end_id: {tokenizer.think_end_id}")
         grammar_backend = ReasonerGrammarBackend(
             grammar_backend, tokenizer.think_end_id
         )

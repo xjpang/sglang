@@ -698,12 +698,16 @@ class Scheduler(
 
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
-            reasoning_parser = ReasoningParser(
+            reasoning_parser: ReasoningParser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            logger.info(
+                f"jimpang think_end_token: {reasoning_parser.detector.think_end_token}"
             )
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+            logger.info(f"jimpang think_end_id: {self.tokenizer.think_end_id}")
 
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
