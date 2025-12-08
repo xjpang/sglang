@@ -176,6 +176,7 @@ class BaseGrammarBackend:
     def get_cached_or_future_value(
         self, key: Tuple[str, str]
     ) -> Optional[BaseGrammarObject]:
+        logger.info(f"jimpang 6, cache: {self.cache}")
         value = self.cache.get(key)
         if value:
             return value.copy(), True
@@ -183,9 +184,11 @@ class BaseGrammarBackend:
         return value, False
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        logger.info(f"jimpang 7, set cache: {self.cache}")
         self.cache[key] = value
 
     def reset(self):
+        logger.info(f"jimpang 8, clear cache: {self.cache}")
         self.cache.clear()
 
 
