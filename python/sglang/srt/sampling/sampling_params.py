@@ -91,6 +91,7 @@ class SamplingParams:
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
         self.sampling_seed = sampling_seed
+        logger.info(f"jimpang 5 skip_delay_decoding:{skip_delay_decoding}")
         self.skip_delay_decoding = skip_delay_decoding
 
         # Process some special cases

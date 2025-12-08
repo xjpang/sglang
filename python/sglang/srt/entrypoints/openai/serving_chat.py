@@ -177,6 +177,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.reasoning_parser and not self._get_enable_thinking_from_request(
             request
         ):
+            logger.info(f"jimpang 1 ...........")
             sampling_params["skip_delay_decoding"] = True
 
         # Handle single vs multiple requests

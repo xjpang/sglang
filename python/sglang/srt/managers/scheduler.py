@@ -1437,6 +1437,7 @@ class Scheduler(
                     and cache_hit
                     and hasattr(value, "is_in_reasoning")
                 ):
+                    logger.info(f"jimpang 3 ...........")
                     value.is_in_reasoning = False
 
                 req.grammar = value
@@ -2153,6 +2154,7 @@ class Scheduler(
                 if req.sampling_params.skip_delay_decoding and hasattr(
                     req.grammar, "is_in_reasoning"
                 ):
+                    logger.info(f"jimpang 4 ...........")
                     req.grammar.is_in_reasoning = False
 
                 num_ready_reqs += 1
@@ -2194,6 +2196,7 @@ class Scheduler(
                 if req.sampling_params.skip_delay_decoding and hasattr(
                     req.grammar, "is_in_reasoning"
                 ):
+                    logger.info(f"jimpang 2 ...........")
                     req.grammar.is_in_reasoning = False
         else:
             num_ready_reqs_max = num_ready_reqs
