@@ -418,7 +418,8 @@ class Glm47MoeDetector(BaseFormatDetector):
             )
             if partial_match:
                 func_name = partial_match.group(1).strip()
-                func_args_raw = partial_match.group(2).strip()
+                func_args_raw = partial_match.group(2)
+                func_args_raw = func_args_raw.strip() if func_args_raw else ""
                 is_tool_end = partial_match.group(3)
 
                 # Initialize state if this is the first tool call
@@ -438,7 +439,11 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                 # Send tool name first if not sent yet
                 if not self.current_tool_name_sent:
-                    assert func_name, "func_name should not be empty"
+                    # Wait for func_name to be complete before sending
+                    # func_name is complete only when we see <arg_key> or </tool_call>
+                    # If is_tool_end is empty string (matched $), func_name may be incomplete
+                    if not func_name or (not func_args_raw and is_tool_end == ""):
+                        return StreamingParseResult(normal_text="", calls=[])
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -484,17 +489,13 @@ class Glm47MoeDetector(BaseFormatDetector):
                         self._streamed_raw_length = current_raw_length
 
                     if is_tool_end == self.eot_token:
-                        if self._is_first_param:
-                            empty_object = "{}"
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters=empty_object,
-                                )
-                            )
-                            self._last_arguments += empty_object
-                        elif not self._last_arguments.endswith("}"):
+                        # For empty parameters case: don't send anything
+                        # The OpenAI API layer will handle the empty {} in final aggregation
+                        if (
+                            not self._is_first_param
+                            and not self._last_arguments.endswith("}")
+                        ):
+                            # Only send closing brace if we have started parameters
                             closing_brace = "}"
                             calls.append(
                                 ToolCallItem(
@@ -524,7 +525,6 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                         # Remove the completed tool call from buffer
                         self._buffer = current_text[partial_match.end(3) :]
-
                         result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
                         self._last_arguments = ""
@@ -532,7 +532,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                         self._streamed_raw_length = 0
                         self._reset_streaming_state()
                         return result
-
             return StreamingParseResult(normal_text="", calls=calls)
 
         except Exception as e:
