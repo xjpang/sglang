@@ -963,7 +963,7 @@ class Glm4MoeModel(nn.Module):
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers[normal_end_layer : self.end_layer],
+                layers=self.layers[normal_end_layer: self.end_layer],
                 enable_tbo=True,
                 positions=positions,
                 forward_batch=forward_batch,
@@ -1040,6 +1040,10 @@ class Glm4MoeForCausalLM(nn.Module):
         elif get_moe_a2a_backend().is_deepep():
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
 
+        # www fix
+        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
+            disable_reason = "Deepseek and GLM-4.5 or GLM-4.6 W4AFP8 model uses different quant method for routed experts and shared experts."
+
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
             log_info_on_rank0(
@@ -1114,6 +1118,15 @@ class Glm4MoeForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+
+        # www fix
+        # Params for special naming rules in mixed-precision models, for example:
+        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
+        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
+        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
+                num_experts=self.config.n_routed_experts
+            )
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
