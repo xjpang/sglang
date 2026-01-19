@@ -321,8 +321,32 @@ class Glm47MoeDetector(BaseFormatDetector):
                 )
                 return json.dumps(str(value) if value else "", ensure_ascii=False)
         else:
-            # For object/array types, return as-is (should already be valid JSON)
-            return value
+            # For object/array types, ensure JSON is complete
+            try:
+                # Try to parse as JSON to check completeness
+                parsed = json.loads(value)
+                return value
+            except json.JSONDecodeError:
+                # If JSON is incomplete, try to fix it
+                # Count brackets to determine what's missing
+                open_braces = value.count("{") - value.count("}")
+                open_brackets = value.count("[") - value.count("]")
+
+                fixed_value = value
+                # Add missing closing brackets
+                fixed_value += "]" * open_brackets
+                # Add missing closing braces
+                fixed_value += "}" * open_braces
+
+                # Try again
+                try:
+                    json.loads(fixed_value)
+                    logger.warning(f"Fixed incomplete JSON: {value} -> {fixed_value}")
+                    return fixed_value
+                except json.JSONDecodeError:
+                    # If still not valid, fallback to string
+                    logger.warning(f"Failed to fix incomplete JSON: {value}")
+                    return json.dumps(value, ensure_ascii=False)
 
     def _process_xml_to_json_streaming(
         self, raw_increment: str, func_name: str, tools: List[Tool]
@@ -390,10 +414,39 @@ class Glm47MoeDetector(BaseFormatDetector):
                                     final_value, ensure_ascii=False
                                 )[1:-1]
                             else:
+                                # For object/array types, ensure JSON is complete when streaming ends
                                 json_output += final_value
+
                         # Always output closing quote for string type when value was started
                         if value_type == "string":
                             json_output += '"'
+                        # For object/array types, check if we need to close brackets
+                        elif value_type in ["object", "array"]:
+                            # Check if the current json_output ends with proper closing brackets
+                            # This is a heuristic to handle cases where streaming might have missed closing brackets
+                            temp_full_value = (
+                                self._last_arguments + json_output
+                                if self._last_arguments
+                                else json_output
+                            )
+                            open_braces = temp_full_value.count(
+                                "{"
+                            ) - temp_full_value.count("}")
+                            open_brackets = temp_full_value.count(
+                                "["
+                            ) - temp_full_value.count("]")
+
+                            # Only add closing brackets if we're at the end of the value
+                            if open_braces > 0:
+                                json_output += "}" * open_braces
+                                logger.warning(
+                                    f"Added missing closing braces: {open_braces}"
+                                )
+                            if open_brackets > 0:
+                                json_output += "]" * open_brackets
+                                logger.warning(
+                                    f"Added missing closing brackets: {open_brackets}"
+                                )
                     else:
                         # Value was never started (empty or complete in one chunk)
                         json_output += self._format_value_complete(
@@ -566,6 +619,9 @@ class Glm47MoeDetector(BaseFormatDetector):
         """
         calls = []
 
+        # Get the complete streamed arguments for this tool call
+        complete_args = self.streamed_args_for_tool[self.current_tool_id]
+
         # Handle no-arg function or need to close braces
         if self._is_first_param and not self._sent_empty_object:
             # No-arg function
@@ -579,18 +635,38 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
-            # Need to close brace
-            calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id,
-                    name=None,
-                    parameters="}",
+        else:
+            # Check if we need to close braces for the arguments
+            # Count open vs closed braces to determine what's missing
+            open_braces = complete_args.count("{") - complete_args.count("}")
+            open_brackets = complete_args.count("[") - complete_args.count("]")
+
+            # Need to close brace(s)
+            if (open_braces > 0 or open_brackets > 0) and not self._sent_empty_object:
+                # First close any open brackets, then braces (proper nesting)
+                closing_chars = "]" * open_brackets + "}" * open_braces
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None,
+                        parameters=closing_chars,
+                    )
                 )
-            )
-            self._last_arguments += "}"
-            self.streamed_args_for_tool[self.current_tool_id] += "}"
-            self._sent_empty_object = True
+                self._last_arguments += closing_chars
+                self.streamed_args_for_tool[self.current_tool_id] += closing_chars
+                self._sent_empty_object = True
+            elif not complete_args.endswith("}") and not self._sent_empty_object:
+                # Fallback: if arguments don't end with }, add it
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None,
+                        parameters="}",
+                    )
+                )
+                self._last_arguments += "}"
+                self.streamed_args_for_tool[self.current_tool_id] += "}"
+                self._sent_empty_object = True
 
         # Parse final arguments
         if func_args_raw:
@@ -627,6 +703,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         """
         self._buffer += new_text
         current_text = self._buffer
+        logger.info(f"jimpang streaming increment new_text: {new_text}")
+        logger.info(f"jimpang streaming increment current_text: {current_text}")
 
         # Check if we have a tool call
         has_tool_call = self.bot_token in current_text
