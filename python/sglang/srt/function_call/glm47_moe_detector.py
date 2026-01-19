@@ -142,6 +142,29 @@ def parse_arguments(
         return json_value, False
 
 
+def get_missing_brace_count(text: str) -> int:
+    """Count number of missing closing braces in a JSON string."""
+    balance = 0
+    in_string = False
+    escape = False
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+        else:
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                balance += 1
+            elif char == "}":
+                balance -= 1
+    return max(0, balance)
+
+
 class Glm47MoeDetector(BaseFormatDetector):
     """
     Detector for GLM-4.7 and GLM-5 models.
@@ -382,6 +405,41 @@ class Glm47MoeDetector(BaseFormatDetector):
                     # Use cached value type for consistency
                     value_type = self._cached_value_type or "string"
 
+                    # Fix for incomplete JSON values (e.g. missing closing brace in speculative decoding)
+                    if value_type != "string":
+                        try:
+                            # Check if the current value is valid JSON
+                            json.loads(self._current_value)
+                        except json.JSONDecodeError:
+                            # Attempt to fix missing closing tokens
+                            if self._current_value.startswith(
+                                "{"
+                            ) and not self._current_value.endswith("}"):
+                                fixed_val = self._current_value + "}"
+                                try:
+                                    json.loads(fixed_val)
+                                    # If fixed, stream the missing brace
+                                    final_value += "}"
+                                    self._current_value += "}"
+                                    logger.debug(
+                                        f"Fixed missing brace in object value: {self._current_value}"
+                                    )
+                                except json.JSONDecodeError:
+                                    pass
+                            elif self._current_value.startswith(
+                                "["
+                            ) and not self._current_value.endswith("]"):
+                                fixed_val = self._current_value + "]"
+                                try:
+                                    json.loads(fixed_val)
+                                    final_value += "]"
+                                    self._current_value += "]"
+                                    logger.debug(
+                                        f"Fixed missing bracket in array value: {self._current_value}"
+                                    )
+                                except json.JSONDecodeError:
+                                    pass
+
                     if self._value_started:
                         # Output any remaining content
                         if final_value:
@@ -579,18 +637,21 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
+        elif not self._sent_empty_object:
             # Need to close brace
-            calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id,
-                    name=None,
-                    parameters="}",
+            missing_brace_count = get_missing_brace_count(self._last_arguments)
+            if missing_brace_count > 0:
+                closing = "}" * missing_brace_count
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None,
+                        parameters=closing,
+                    )
                 )
-            )
-            self._last_arguments += "}"
-            self.streamed_args_for_tool[self.current_tool_id] += "}"
-            self._sent_empty_object = True
+                self._last_arguments += closing
+                self.streamed_args_for_tool[self.current_tool_id] += closing
+                self._sent_empty_object = True
 
         # Parse final arguments
         if func_args_raw:
@@ -627,6 +688,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         """
         self._buffer += new_text
         current_text = self._buffer
+        logger.info(f"jimpang streaming increment new_text: {new_text}")
+        logger.info(f"jimpang streaming increment current_text: {current_text}")
 
         # Check if we have a tool call
         has_tool_call = self.bot_token in current_text
