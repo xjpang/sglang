@@ -397,9 +397,41 @@ class Glm47MoeDetector(BaseFormatDetector):
                         func_name, self._current_key, tools
                     )
 
+                else:
+                    # Check for missing <arg_value> tag
+                    stripped_buffer = self._xml_tag_buffer.lstrip()
+                    if stripped_buffer and not "<arg_value>".startswith(
+                        stripped_buffer
+                    ):
+                        # Implicit transition: content doesn't match <arg_value> prefix
+                        # Assume <arg_value> was skipped by the model
+                        self._stream_state = StreamState.IN_VALUE
+                        self._current_value = ""
+                        self._value_started = False
+                        # Do NOT clear buffer, as it contains the start of the value
+
+                        self._cached_value_type = self._get_value_type(
+                            func_name, self._current_key, tools
+                        )
+                        logger.debug(
+                            f"Implicitly started value for {self._current_key} (buffer: {self._xml_tag_buffer})"
+                        )
+
             elif self._stream_state == StreamState.IN_VALUE:
-                if self._xml_tag_buffer.endswith("</arg_value>"):
-                    final_value = self._xml_tag_buffer[:-12]
+                # Check for explicit or implicit value terminators
+                is_explicit_close = self._xml_tag_buffer.endswith("</arg_value>")
+                is_start_next_key = self._xml_tag_buffer.endswith("<arg_key>")
+                is_tool_end = self._xml_tag_buffer.endswith("</tool_call>")
+
+                if is_explicit_close or is_start_next_key or is_tool_end:
+                    if is_explicit_close:
+                        trim_len = 12  # len("</arg_value>")
+                    elif is_start_next_key:
+                        trim_len = 9  # len("<arg_key>")
+                    else:  # is_tool_end
+                        trim_len = 12  # len("</tool_call>")
+
+                    final_value = self._xml_tag_buffer[:-trim_len]
                     self._current_value += final_value
 
                     # Use cached value type for consistency
@@ -459,15 +491,28 @@ class Glm47MoeDetector(BaseFormatDetector):
                         )
 
                     self._xml_tag_buffer = ""
-                    self._stream_state = StreamState.BETWEEN
                     self._current_value = ""
                     self._value_started = False
                     self._cached_value_type = None  # Reset cached type
+
+                    # Transition based on what terminated the value
+                    if is_start_next_key:
+                        self._stream_state = StreamState.IN_KEY
+                        # Implicit transition means we skipped the BETWEEN state where comma is normally added
+                        json_output += ", "
+                    else:
+                        # For explicit close or tool end, go to BETWEEN (waiting for next key or end)
+                        self._stream_state = StreamState.BETWEEN
                 else:
-                    closing_tag = "</arg_value>"
-                    is_potential_closing = len(self._xml_tag_buffer) <= len(
-                        closing_tag
-                    ) and closing_tag.startswith(self._xml_tag_buffer)
+                    # Check if the buffer resembles a prefix of ANY terminator
+                    closing_tags = ["</arg_value>", "<arg_key>", "</tool_call>"]
+                    is_potential_closing = False
+                    for tag in closing_tags:
+                        if len(self._xml_tag_buffer) <= len(tag) and tag.startswith(
+                            self._xml_tag_buffer
+                        ):
+                            is_potential_closing = True
+                            break
 
                     if not is_potential_closing:
                         content = self._xml_tag_buffer
