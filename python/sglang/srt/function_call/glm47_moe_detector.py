@@ -733,8 +733,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         """
         self._buffer += new_text
         current_text = self._buffer
-        logger.info(f"jimpang streaming increment new_text: {new_text}")
-        logger.info(f"jimpang streaming increment current_text: {current_text}")
+        # logger.info(f"jimpang streaming increment new_text: {new_text}")
+        # logger.info(f"jimpang streaming increment current_text: {current_text}")
 
         # Check if we have a tool call
         has_tool_call = self.bot_token in current_text
