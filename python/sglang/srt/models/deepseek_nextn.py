@@ -73,6 +73,22 @@ class DeepseekModelNextN(nn.Module):
                 is_checkpoint_fp8_serialized=True,
                 weight_block_size=[128, 128],
             )
+        elif (
+            quant_config is not None
+            and quant_config.get_name() == "w4afp8"
+            and getattr(quant_config, "fp8_moe_layers", [])
+        ):
+            # W4AFP8 mixed-precision: the nextn/MTP MoE layer retains fp8
+            # quantization. Override here because the nextn model uses prefix
+            # "model.decoder.mlp.experts" (not the checkpoint path stored in
+            # fp8_moe_layers), so is_layer_skipped() cannot match it.
+            moe_quant_config_override = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=getattr(
+                    quant_config, "weight_block_size", [128, 128]
+                ),
+            )
         else:
             moe_quant_config_override = None
 

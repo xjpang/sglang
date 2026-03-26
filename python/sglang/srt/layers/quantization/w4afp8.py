@@ -44,6 +44,7 @@ class W4AFp8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: Optional[List[int]] = None,
         group_size: int = 128,
+        fp8_moe_layers: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
@@ -57,6 +58,10 @@ class W4AFp8Config(QuantizationConfig):
         self.ignored_layers = ignored_layers or []
         self.weight_block_size = [128, 128]
         self.group_size = group_size
+        # FusedMoE layers that retain fp8 quantization instead of w4a8.
+        # Used for mixed-precision models where certain MoE layers (e.g., the
+        # nextn/MTP speculative-decoding layer) are kept in fp8 format.
+        self.fp8_moe_layers = fp8_moe_layers or []
 
     @classmethod
     def get_name(cls) -> str:
@@ -77,17 +82,34 @@ class W4AFp8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W4AFp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_fp8_serialized = "fp8" in quant_method
-        is_checkpoint_w4afp8_serialized = "w4afp8" in quant_method
+        # "mixed" is a custom format indicating a model where the base precision
+        # is fp8 and certain layers (e.g. MoE experts) are overridden to w4a8.
+        # Treat it as both fp8-serialized and w4afp8-serialized.
+        is_mixed = quant_method == "mixed"
+        is_checkpoint_fp8_serialized = "fp8" in quant_method or is_mixed
+        is_checkpoint_w4afp8_serialized = "w4afp8" in quant_method or is_mixed
         linear_activation_scheme = "dynamic"
         moe_activation_scheme = "static"
         weight_block_size = [128, 128]
+
+        # Parse fp8_moe_layers: FusedMoE layer prefixes that should use fp8
+        # instead of w4a8 (e.g. nextn/MTP layers kept in fp8 format).
+        # Supports two config formats:
+        #   1. Direct list:  {"fp8_moe_layers": ["model.layers.61.mlp.experts"]}
+        #   2. layer_mapping format used by custom mixed-quant tools:
+        #      {"layer_mapping": {"w4a8": {"ignored_layers": ["model.layers.61.mlp.experts."]}}}
+        fp8_moe_layers: List[str] = list(config.get("fp8_moe_layers", []))
+        layer_mapping = config.get("layer_mapping", {})
+        w4a8_mapping = layer_mapping.get("w4a8", {})
+        fp8_moe_layers.extend(w4a8_mapping.get("ignored_layers", []))
+
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
             weight_block_size=weight_block_size,
+            fp8_moe_layers=fp8_moe_layers if fp8_moe_layers else None,
         )
 
     def get_quant_method(
@@ -101,6 +123,16 @@ class W4AFp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if self.fp8_moe_layers and is_layer_skipped(prefix, self.fp8_moe_layers):
+                # This MoE layer is kept in fp8 format (e.g. nextn/MTP layer).
+                from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+
+                fp8_config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    activation_scheme="dynamic",
+                    weight_block_size=self.weight_block_size,
+                )
+                return Fp8MoEMethod(fp8_config)
             return W4AFp8MoEMethod(self)
         return None
 

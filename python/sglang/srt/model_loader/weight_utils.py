@@ -201,6 +201,21 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        # For models with a separate quantize_config.json (e.g. custom mixed
+        # w4a8/fp8 quantization), merge the layer_mapping into the quant config
+        # so that per-layer precision overrides (like keeping nextn/MTP MoE
+        # layers in fp8) are visible to W4AFp8Config.from_config().
+        local_model_path = model_config.model_path
+        if os.path.isdir(local_model_path):
+            supplementary_path = os.path.join(local_model_path, "quantize_config.json")
+            if os.path.exists(supplementary_path):
+                with open(supplementary_path) as _f:
+                    supplementary = json.load(_f)
+                if (
+                    "layer_mapping" in supplementary
+                    and "layer_mapping" not in hf_quant_config
+                ):
+                    hf_quant_config["layer_mapping"] = supplementary["layer_mapping"]
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -237,6 +252,26 @@ def get_quant_config(
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+        # Even when no config file is required, try to read quantize_config.json
+        # if it exists at the model path.  Custom mixed-precision tools (e.g.
+        # w4a8/fp8 mixed quantizers) store per-layer precision overrides there
+        # (layer_mapping / fp8_moe_layers) that are needed to load nextn/MTP
+        # MoE layers correctly.
+        supplementary_path = os.path.join(hf_folder, "quantize_config.json")
+        if os.path.exists(supplementary_path):
+            with open(supplementary_path) as _f:
+                supplementary = json.load(_f)
+            if "layer_mapping" in supplementary or "fp8_moe_layers" in supplementary:
+                supplementary["packed_modules_mapping"] = packed_modules_mapping
+                # Custom formats (e.g. quant_method="mixed") may not match the
+                # registered method name; override with the detected quantization
+                # type so that from_config() works correctly.
+                if supplementary.get("quant_method", "") not in (
+                    model_config.quantization,
+                    "",
+                ):
+                    supplementary["quant_method"] = model_config.quantization
+                return quant_cls.from_config(supplementary)
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
