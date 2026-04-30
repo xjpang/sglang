@@ -532,6 +532,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
+        self.dequant_shared_experts = envs.SGLANG_DSV4_DEQUANT_SHARED_EXPERTS.get()
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
@@ -539,7 +540,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=None if self.dequant_shared_experts else quant_config,
                 reduce_results=False,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 prefix=add_prefix("shared_experts", prefix),

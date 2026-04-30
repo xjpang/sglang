@@ -1638,8 +1638,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if envs.SGLANG_DSV4_FP4_EXPERTS.get():
                     weights = _dequant_fp8_wo_a(weights)
                 else:
-                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                    weights = (
+                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
+                    )
                 # ------------------------------------------------------------------------
+
+        if (
+            envs.SGLANG_DSV4_DEQUANT_SHARED_EXPERTS.get()
+            and self.num_fused_shared_experts == 0
+        ):
+            log_info_on_rank0(
+                logger, "Dequantizing shared_experts fp8 weights to bf16."
+            )
+            weights = _dequant_fp8_shared_experts(weights)
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -1970,8 +1981,11 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float8_e8m0fnu,
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
-    if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and not is_large_dummy_model():
-        assert weight.shape == (8192, 4096), f"unexpected weight shape {weight.shape}"
+    if (
+        envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get()
+        and not is_large_dummy_model()
+        and weight.shape == (8192, 4096)
+    ):
         assert scale.shape == (64, 32), f"unexpected scale shape {scale.shape}"
 
     weight_f32 = rearrange(
@@ -1980,8 +1994,6 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     result = rearrange(
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
-    if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and not is_large_dummy_model():
-        assert result.shape == (8192, 4096)
 
     return result.to(torch.bfloat16)
 
@@ -2065,6 +2077,40 @@ def _dequant_fp8_wo_a(
         assert scale_name in weights_dict
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
+        yield name, _dequant_fp8(weight, scale)
+
+    yield from weights_dict.items()
+
+
+def _dequant_fp8_shared_experts(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    weights_dict = dict(weights)
+
+    # Raw checkpoint names are pre-remap, so shared_experts may appear under
+    # either ".mlp.shared_experts." or ".ffn.shared_experts.", and scales may
+    # use either ".weight_scale_inv" or ".scale" suffix. Match all variants.
+    for name in list(weights_dict.keys()):
+        if name not in weights_dict:
+            continue
+        if "shared_experts." not in name:
+            continue
+        if not name.endswith(".weight"):
+            continue
+        base = name[: -len(".weight")]
+        scale_name = None
+        for suffix in (".weight_scale_inv", ".scale"):
+            candidate = base + suffix
+            if candidate in weights_dict:
+                scale_name = candidate
+                break
+        if scale_name is None:
+            continue
+        weight = weights_dict.pop(name)
+        scale = weights_dict.pop(scale_name)
+        if weight.dtype != torch.float8_e4m3fn:
+            yield name, weight
+            continue
         yield name, _dequant_fp8(weight, scale)
 
     yield from weights_dict.items()
