@@ -257,6 +257,20 @@ class OpenAIServingChat(OpenAIServingBase):
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
 
+        # venus adapt begin
+        if request.thinking_enabled:
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {"thinking": True}
+            else:
+                request.chat_template_kwargs["thinking"] = True
+
+            if request.reasoning_effort is None or request.reasoning_effort not in [
+                "high",
+                "max",
+            ]:
+                request.reasoning_effort = "high"
+        # venus adapt end
+
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 

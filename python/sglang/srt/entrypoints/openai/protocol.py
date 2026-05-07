@@ -604,6 +604,10 @@ class ChatCompletionRequest(BaseModel):
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # For venus adapt begin
+    thinking_enabled: Optional[bool] = False
+    # For venus adapt end
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
