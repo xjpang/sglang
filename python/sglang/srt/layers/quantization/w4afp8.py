@@ -93,10 +93,29 @@ class W4AFp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.environ import envs as _envs
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            # DSv4 W4AFP8: routed experts 走 cutlass(下面 FusedMoE 分支),
+            # 其余 FP8 块量化的 Linear 在 SGLANG_DSV4_DEQUANT_NONMOE_FP8=true
+            # 时按 SGLANG_DSV4_DEQUANT_NONMOE_FP8_SCOPE 决定范围走 unquant 路径:
+            # - "all" (default): 全部非 MoE FP8 → bf16。
+            #   适合单条/低 QPS:单条 decode M=1 下 bf16 cuBLAS 反而快过
+            #   FP8+per-token-quant 链路。
+            # - "shared_only": 只 shared_experts → bf16,attn 保留 FP8 走 DeepGEMM。
+            #   适合高 QPS:decode batch 大时 FP8 的算力/带宽优势能压过 quant overhead。
+            # 两种模式都解决 3072/tp 撞 block_n=128 整除约束的问题
+            # (卡的就是 shared_experts)。
+            if _envs.SGLANG_DSV4_DEQUANT_NONMOE_FP8.get():
+                scope = _envs.SGLANG_DSV4_DEQUANT_NONMOE_FP8_SCOPE.get()
+                if scope == "all":
+                    return UnquantizedLinearMethod()
+                elif scope == "shared_only":
+                    if "shared_experts." in prefix:
+                        return UnquantizedLinearMethod()
+                # 其它值(包括空字符串)视为 off,掉入下方 ignored_layers 逻辑
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)

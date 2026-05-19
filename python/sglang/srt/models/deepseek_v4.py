@@ -20,7 +20,7 @@ from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
-from sglang.srt.environ import envs, is_large_dummy_model
+from sglang.srt.environ import is_large_dummy_model
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -82,7 +83,6 @@ MOE_BIT_WISE_EQUAL_MODE = False
 ATTN_BIT_WISE_EQUAL_MODE = False
 COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
@@ -824,9 +824,22 @@ class MQALayer(nn.Module):
         debug_return_kv: bool = False,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            assert (
-                not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            if self.wo_b.reduce_results:
+                if forward_batch.forward_mode.is_idle():
+                    if is_dp_attention_enabled():
+                        get_attention_tp_group().all_reduce(
+                            torch.zeros(1, device=x.device, dtype=torch.float32)
+                        )
+                    else:
+                        assert False, (
+                            "short-circuiting allreduce will lead to hangs "
+                            "(wo_b.reduce_results without DP-attention idle sync path)"
+                        )
+                else:
+                    assert False, (
+                        "short-circuiting allreduce will lead to hangs "
+                        "(empty batch with wo_b.reduce_results on non-IDLE forward)"
+                    )
             return x
 
         attn_backend = forward_batch.attn_backend
@@ -1591,6 +1604,54 @@ class DeepseekV4ForCausalLM(nn.Module):
         else:
             assert envs.SGLANG_DSV4_2604_SUBMODE.get() == ""
 
+        # 兼容老版 W4AFP8 checkpoint 的 scale 命名:
+        # 早期导出用 ".scale",新版统一成 ".weight_scale_inv"。
+        # 路由专家的 ".weight_scale_inv" 本来就存在,只改末尾精确为 ".scale" 的。
+        def _normalize_scale_names(ws):
+            for n, t in ws:
+                if n.endswith(".scale"):
+                    n = n[: -len(".scale")] + ".weight_scale_inv"
+                yield n, t
+
+        weights = _normalize_scale_names(weights)
+
+        # 配合 SGLANG_DSV4_DEQUANT_NONMOE_FP8:按 SGLANG_DSV4_DEQUANT_NONMOE_FP8_SCOPE
+        # 决定范围把 FP8 块量化权重 dequant 成 bf16。
+        # - "all" (default): 全部非 routed-expert FP8 → bf16,单条延迟最优。
+        # - "shared_only": 只 shared_experts → bf16,attn FP8 保留,高 QPS 吞吐更优。
+        # 两种模式都规避 shared_experts 3072/tp 撞 block_n=128 的约束。
+        # Routed expert 的 W4 权重(int8 pack)dtype 不是 fp8_e4m3fn,自动放行;
+        # routed 的 .weight_scale_inv 也不会有配对的 fp8 weight,自动放行。
+        def _dequant_nonmoe_fp8(ws):
+            if not envs.SGLANG_DSV4_DEQUANT_NONMOE_FP8.get():
+                yield from ws
+                return
+            scope = envs.SGLANG_DSV4_DEQUANT_NONMOE_FP8_SCOPE.get()
+            if scope not in ("all", "shared_only"):
+                # 未知值按 off 处理
+                yield from ws
+                return
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            pool = dict(ws)
+            for name in list(pool.keys()):
+                if not name.endswith(".weight"):
+                    continue
+                if scope == "shared_only" and "shared_experts." not in name:
+                    continue
+                w = pool.get(name)
+                if w is None or w.dtype != torch.float8_e4m3fn:
+                    continue
+                scale_name = name[: -len(".weight")] + ".weight_scale_inv"
+                s = pool.get(scale_name)
+                if s is None:
+                    continue
+                pool[name] = block_quant_dequant(w, s, [128, 128], torch.bfloat16)
+                pool.pop(scale_name)
+            yield from pool.items()
+
+        weights = _dequant_nonmoe_fp8(weights)
+
         if (
             envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get()
             and envs.SGLANG_DSV4_MODE.get() == "2604"
@@ -1638,7 +1699,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if envs.SGLANG_DSV4_FP4_EXPERTS.get():
                     weights = _dequant_fp8_wo_a(weights)
                 else:
-                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                    weights = (
+                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
+                    )
                 # ------------------------------------------------------------------------
 
         stacked_params_mapping = [
@@ -2062,7 +2125,11 @@ def _dequant_fp8_wo_a(
         if not name.endswith(".wo_a.weight"):
             continue
         scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
-        assert scale_name in weights_dict
+        # W4AFP8 checkpoint 把 wo_a 直存为 bf16,没有配套 .wo_a.scale;
+        # 只有 FP8 checkpoint 才需要在这里 dequant。没 scale 就原样放行。
+        if scale_name not in weights_dict:
+            continue
+        # assert scale_name in weights_dict
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
         yield name, _dequant_fp8(weight, scale)

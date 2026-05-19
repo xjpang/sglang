@@ -224,6 +224,22 @@ def _load_deepseek_temp_model(
     config_json["architectures"] = [architecture]
     config_json["model_type"] = "deepseek_v3"
 
+    # backup 里写死了 quantization_config=fp8，会把 W4AFP8 等其它 V4 checkpoint
+    # 撞到 model_config._verify_quantization 的 mismatch 分支。按 checkpoint 还原:
+    #   - checkpoint 的 config.json 里带 quantization_config,直接用它
+    #   - checkpoint 目录下有 hf_quant_config.json (MIXED_PRECISION / ModelOpt),
+    #     丢掉 backup 里的 quantization_config,让 ModelConfig._parse_quant_hf_config
+    #     回退到 hf_quant_config.json 解析
+    real_config_file = os.path.join(local_path, "config.json")
+    if os.path.exists(real_config_file):
+        with open(real_config_file, "r") as f:
+            real_cfg = json.load(f)
+        real_qc = real_cfg.get("quantization_config")
+        if real_qc is not None:
+            config_json["quantization_config"] = real_qc
+        elif os.path.exists(os.path.join(local_path, "hf_quant_config.json")):
+            config_json.pop("quantization_config", None)
+
     tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
 

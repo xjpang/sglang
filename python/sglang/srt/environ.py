@@ -474,6 +474,8 @@ class Envs:
     SGLANG_DSV4_MODE = EnvStr("2604")
     SGLANG_DSV4_2604_SUBMODE = EnvStr("2604B")
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)  # Set False when using FP4-to-FP8 converted checkpoint with 2604 config
+    SGLANG_DSV4_DEQUANT_NONMOE_FP8 = EnvBool(False)  # Dequant non-MoE FP8 block-quant weights to bf16 at load time (bypasses block_size=128 TP divisibility constraint)
+    SGLANG_DSV4_DEQUANT_NONMOE_FP8_SCOPE = EnvStr("all")  # "all": dequant everything non-MoE FP8 (best single-request latency). "shared_only": only shared_experts (keep attn FP8 for high-QPS throughput).
     SGLANG_OPT_HISPARSE_C4_SHRINK = EnvInt(1)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
