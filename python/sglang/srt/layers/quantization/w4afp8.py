@@ -93,10 +93,25 @@ class W4AFp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.environ import envs as _envs
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            # DSv4 W4AFP8: routed experts 走 cutlass(下面 FusedMoE 分支),
+            # 其余 FP8 块量化的 Linear 在 SGLANG_DSV4_DEQUANT_NONMOE_FP8=true
+            # 时按 SGLANG_DSV4_DEQUANT_NONMOE_FP8_SCOPE 决定范围走 unquant 路径:
+            # - "all" (default): 全部非 MoE FP8 → bf16,适合单条/低 QPS。
+            # - "shared_only": 只 shared_experts → bf16,attn 保留 FP8,适合高 QPS。
+            # 两种模式都解决 3072/tp 撞 block_n=128 整除约束的问题。
+            _flag = _envs.SGLANG_DSV4_DEQUANT_NONMOE_FP8.get()
+            _scope = _envs.SGLANG_DSV4_DEQUANT_NONMOE_FP8_SCOPE.get()
+            if _flag:
+                if _scope == "all":
+                    return UnquantizedLinearMethod()
+                elif _scope == "shared_only":
+                    if "shared_experts." in prefix:
+                        return UnquantizedLinearMethod()
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)

@@ -575,6 +575,8 @@ class Envs:
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    SGLANG_DSV4_DEQUANT_NONMOE_FP8 = EnvBool(False)  # Dequant non-MoE FP8 block-quant weights to bf16 at load time (bypasses block_size=128 TP divisibility constraint)
+    SGLANG_DSV4_DEQUANT_NONMOE_FP8_SCOPE = EnvStr("all")  # "all": dequant everything non-MoE FP8 (best single-request latency). "shared_only": only shared_experts (keep attn FP8 for high-QPS throughput).
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
