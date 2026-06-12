@@ -62,6 +62,116 @@ class PPBatchMetadata:
     can_run_cuda_graph: bool
 
 
+def _pp_tensor_scalar(tensor_dict: Dict[str, torch.Tensor], key: str):
+    value = tensor_dict.get(key)
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        return int(value.item())
+    return None
+
+
+def _pp_batch_num_tokens(batch: Optional[ScheduleBatch]) -> Optional[int]:
+    if batch is None:
+        return None
+    input_ids = getattr(batch, "input_ids", None)
+    if isinstance(input_ids, torch.Tensor):
+        return input_ids.numel()
+    if input_ids is not None:
+        return len(input_ids)
+    return getattr(batch, "extend_num_tokens", None)
+
+
+def _pp_batch_rid_hash(batch: Optional[ScheduleBatch]) -> int:
+    if batch is None:
+        return 0
+    # Python's built-in hash is salted per process, so use a small deterministic
+    # rolling hash that is stable across PP ranks.
+    value = 1469598103934665603
+    for req in batch.reqs:
+        for ch in str(getattr(req, "rid", "")):
+            value ^= ord(ch)
+            value = (value * 1099511628211) & 0x7FFFFFFFFFFFFFFF
+    return value
+
+
+def _pp_attach_proxy_metadata(
+    tensor_dict: Dict[str, torch.Tensor], batch: ScheduleBatch, mb_id: int
+) -> Dict[str, torch.Tensor]:
+    hidden_states = tensor_dict.get("hidden_states")
+    input_ids = getattr(batch, "input_ids", None)
+    device = (
+        hidden_states.device
+        if isinstance(hidden_states, torch.Tensor)
+        else input_ids.device if isinstance(input_ids, torch.Tensor) else torch.device("cpu")
+    )
+    tensor_dict["__pp_num_tokens__"] = torch.tensor(
+        [_pp_batch_num_tokens(batch) or -1], dtype=torch.int64, device=device
+    )
+    tensor_dict["__pp_forward_mode__"] = torch.tensor(
+        [int(batch.forward_mode)], dtype=torch.int64, device=device
+    )
+    tensor_dict["__pp_mb_id__"] = torch.tensor([mb_id], dtype=torch.int64, device=device)
+    tensor_dict["__pp_rid_hash__"] = torch.tensor(
+        [_pp_batch_rid_hash(batch)], dtype=torch.int64, device=device
+    )
+    return tensor_dict
+
+
+def _pp_log_proxy_mismatch(
+    *,
+    ps,
+    batch: Optional[ScheduleBatch],
+    tensor_dict: Dict[str, torch.Tensor],
+) -> None:
+    hidden_states = tensor_dict.get("hidden_states")
+    logger.error(
+        "PP proxy metadata mismatch: pp_rank=%s tp_rank=%s attn_tp_rank=%s "
+        "attn_cp_rank=%s cur_forward_mode=%s proxy_forward_mode=%s "
+        "cur_num_tokens=%s proxy_num_tokens=%s hidden_shape=%s "
+        "cur_rid_hash=%s proxy_rid_hash=%s proxy_mb_id=%s cur_batch_reqs=%s "
+        "cur_input_ids_shape=%s cur_out_cache_loc_shape=%s proxy_keys=%s",
+        getattr(ps, "pp_rank", None),
+        getattr(ps, "tp_rank", None),
+        getattr(ps, "attn_tp_rank", None),
+        getattr(ps, "attn_cp_rank", None),
+        int(batch.forward_mode) if batch is not None else None,
+        _pp_tensor_scalar(tensor_dict, "__pp_forward_mode__"),
+        _pp_batch_num_tokens(batch),
+        _pp_tensor_scalar(tensor_dict, "__pp_num_tokens__"),
+        tuple(hidden_states.shape) if isinstance(hidden_states, torch.Tensor) else None,
+        _pp_batch_rid_hash(batch),
+        _pp_tensor_scalar(tensor_dict, "__pp_rid_hash__"),
+        _pp_tensor_scalar(tensor_dict, "__pp_mb_id__"),
+        len(batch.reqs) if batch is not None else None,
+        tuple(batch.input_ids.shape)
+        if batch is not None and isinstance(getattr(batch, "input_ids", None), torch.Tensor)
+        else None,
+        tuple(batch.out_cache_loc.shape)
+        if batch is not None and isinstance(getattr(batch, "out_cache_loc", None), torch.Tensor)
+        else None,
+        sorted(tensor_dict.keys()),
+    )
+
+
+def _pp_validate_proxy_metadata(
+    *, ps, batch: Optional[ScheduleBatch], tensor_dict: Dict[str, torch.Tensor]
+) -> None:
+    if batch is None:
+        return
+    expected_num_tokens = _pp_batch_num_tokens(batch)
+    hidden_states = tensor_dict.get("hidden_states")
+    hidden_tokens = (
+        hidden_states.shape[0] if isinstance(hidden_states, torch.Tensor) else None
+    )
+    # Keep the normal path low perturbation: shape reads do not synchronize CUDA.
+    # Metadata scalar tensors are read only when the proxy is already suspicious.
+    if (
+        hidden_tokens is not None
+        and expected_num_tokens is not None
+        and hidden_tokens != expected_num_tokens
+    ):
+        _pp_log_proxy_mismatch(ps=ps, batch=batch, tensor_dict=tensor_dict)
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -155,7 +265,11 @@ class SchedulerPPMixin:
                             "send_proxy_dict_to_next_stage"
                         ):
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
+                                _pp_attach_proxy_metadata(
+                                    result.pp_hidden_states_proxy_tensors.tensors,
+                                    self.cur_batch,
+                                    mb_id,
+                                ),
                                 async_send=True,
                                 msg_type="proxy",
                             )
@@ -329,7 +443,11 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
+                            _pp_attach_proxy_metadata(
+                                result.pp_hidden_states_proxy_tensors.tensors,
+                                self.cur_batch,
+                                mb_id,
+                            ),
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -512,7 +630,11 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
+                            _pp_attach_proxy_metadata(
+                                result.pp_hidden_states_proxy_tensors.tensors,
+                                self.cur_batch,
+                                mb_id,
+                            ),
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -1043,6 +1165,11 @@ class SchedulerPPMixin:
                         self.attn_tp_group if self.require_attn_tp_allgather else None
                     ),
                 )
+            )
+            _pp_validate_proxy_metadata(
+                ps=self.ps,
+                batch=self.cur_batch,
+                tensor_dict=pp_proxy_tensors.tensors,
             )
         return pp_proxy_tensors
 

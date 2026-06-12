@@ -131,6 +131,157 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
 
+def _safe_shape(value) -> Optional[Tuple[int, ...]]:
+    return tuple(value.shape) if isinstance(value, torch.Tensor) else None
+
+
+def _log_dsv4_position_mismatch(
+    *,
+    layer_id: int,
+    stage: str,
+    q_tokens: int,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    q_out: Optional[torch.Tensor],
+) -> None:
+    logger.error(
+        "DeepSeekV4 fused q norm rope token/position mismatch: "
+        "stage=%s layer_id=%s q_tokens=%s positions_numel=%s "
+        "positions_shape=%s positions_stride=%s positions_dtype=%s positions_device=%s "
+        "x_shape=%s q_lora_shape=%s q_out_shape=%s "
+        "forward_mode=%s batch_size=%s extend_num_tokens=%s seq_lens_sum=%s "
+        "input_ids_shape=%s fb_positions_shape=%s seq_lens_shape=%s "
+        "extend_seq_lens_shape=%s extend_start_loc_shape=%s out_cache_loc_shape=%s "
+        "tbo_split_seq_index=%s is_extend_in_batch=%s all_extend_in_batch=%s "
+        "global_num_tokens_cpu=%s original_global_num_tokens_cpu=%s",
+        stage,
+        layer_id,
+        q_tokens,
+        positions.numel(),
+        tuple(positions.shape),
+        tuple(positions.stride()),
+        positions.dtype,
+        positions.device,
+        tuple(x.shape),
+        tuple(q_lora.shape),
+        _safe_shape(q_out),
+        getattr(forward_batch, "forward_mode", None),
+        getattr(forward_batch, "batch_size", None),
+        getattr(forward_batch, "extend_num_tokens", None),
+        getattr(forward_batch, "seq_lens_sum", None),
+        _safe_shape(getattr(forward_batch, "input_ids", None)),
+        _safe_shape(getattr(forward_batch, "positions", None)),
+        _safe_shape(getattr(forward_batch, "seq_lens", None)),
+        _safe_shape(getattr(forward_batch, "extend_seq_lens", None)),
+        _safe_shape(getattr(forward_batch, "extend_start_loc", None)),
+        _safe_shape(getattr(forward_batch, "out_cache_loc", None)),
+        getattr(forward_batch, "tbo_split_seq_index", None),
+        getattr(forward_batch, "is_extend_in_batch", None),
+        getattr(forward_batch, "all_extend_in_batch", None),
+        getattr(forward_batch, "global_num_tokens_cpu", None),
+        getattr(forward_batch, "original_global_num_tokens_cpu", None),
+    )
+
+
+def _log_dsv4_pp_proxy_mismatch(
+    *,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    pp_proxy_tensors: PPProxyTensors,
+) -> None:
+    logger.error(
+        "DeepSeekV4 PP proxy/forward batch token mismatch: "
+        "hidden_states_shape=%s hidden_states_stride=%s input_ids_shape=%s "
+        "positions_shape=%s forward_mode=%s batch_size=%s extend_num_tokens=%s "
+        "seq_lens_sum=%s fb_input_ids_shape=%s fb_positions_shape=%s "
+        "seq_lens_shape=%s extend_seq_lens_shape=%s out_cache_loc_shape=%s "
+        "proxy_keys=%s proxy_hidden_shape=%s proxy_hidden_stride=%s",
+        tuple(hidden_states.shape),
+        tuple(hidden_states.stride()),
+        tuple(input_ids.shape),
+        tuple(positions.shape),
+        getattr(forward_batch, "forward_mode", None),
+        getattr(forward_batch, "batch_size", None),
+        getattr(forward_batch, "extend_num_tokens", None),
+        getattr(forward_batch, "seq_lens_sum", None),
+        _safe_shape(getattr(forward_batch, "input_ids", None)),
+        _safe_shape(getattr(forward_batch, "positions", None)),
+        _safe_shape(getattr(forward_batch, "seq_lens", None)),
+        _safe_shape(getattr(forward_batch, "extend_seq_lens", None)),
+        _safe_shape(getattr(forward_batch, "out_cache_loc", None)),
+        sorted(pp_proxy_tensors.tensors.keys()),
+        _safe_shape(pp_proxy_tensors["hidden_states"]),
+        tuple(pp_proxy_tensors["hidden_states"].stride()),
+    )
+
+
+def _log_dsv4_layer_token_mismatch(
+    *,
+    layer_id: int,
+    stage: str,
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    input_ids: torch.Tensor,
+    input_ids_global: torch.Tensor,
+    forward_batch: ForwardBatch,
+    use_fused: bool,
+    use_cp: Optional[bool] = None,
+    use_tp_moe_gather: Optional[bool] = None,
+    use_tp_attn_a2a_scatter: Optional[bool] = None,
+) -> None:
+    if hidden_states.shape[0] == positions.numel():
+        return
+    logger.error(
+        "DeepSeekV4 layer token/position mismatch: "
+        "stage=%s layer_id=%s hidden_tokens=%s positions_numel=%s "
+        "hidden_shape=%s hidden_stride=%s positions_shape=%s input_ids_shape=%s "
+        "input_ids_global_shape=%s forward_mode=%s batch_size=%s "
+        "extend_num_tokens=%s seq_lens_sum=%s fb_input_ids_shape=%s "
+        "fb_positions_shape=%s seq_lens_shape=%s extend_seq_lens_shape=%s "
+        "extend_start_loc_shape=%s out_cache_loc_shape=%s tbo_split_seq_index=%s "
+        "is_extend_in_batch=%s all_extend_in_batch=%s use_fused=%s use_cp=%s "
+        "use_tp_moe_gather=%s use_tp_attn_a2a_scatter=%s attn_dp_size=%s "
+        "attn_tp_size=%s attn_tp_rank=%s moe_a2a_backend=%s "
+        "global_num_tokens_cpu=%s original_global_num_tokens_cpu=%s",
+        stage,
+        layer_id,
+        hidden_states.shape[0],
+        positions.numel(),
+        tuple(hidden_states.shape),
+        tuple(hidden_states.stride()),
+        tuple(positions.shape),
+        tuple(input_ids.shape),
+        tuple(input_ids_global.shape),
+        getattr(forward_batch, "forward_mode", None),
+        getattr(forward_batch, "batch_size", None),
+        getattr(forward_batch, "extend_num_tokens", None),
+        getattr(forward_batch, "seq_lens_sum", None),
+        _safe_shape(getattr(forward_batch, "input_ids", None)),
+        _safe_shape(getattr(forward_batch, "positions", None)),
+        _safe_shape(getattr(forward_batch, "seq_lens", None)),
+        _safe_shape(getattr(forward_batch, "extend_seq_lens", None)),
+        _safe_shape(getattr(forward_batch, "extend_start_loc", None)),
+        _safe_shape(getattr(forward_batch, "out_cache_loc", None)),
+        getattr(forward_batch, "tbo_split_seq_index", None),
+        getattr(forward_batch, "is_extend_in_batch", None),
+        getattr(forward_batch, "all_extend_in_batch", None),
+        use_fused,
+        use_cp,
+        use_tp_moe_gather,
+        use_tp_attn_a2a_scatter,
+        get_attention_dp_size(),
+        get_attention_tp_size(),
+        get_attention_tp_rank(),
+        get_moe_a2a_backend(),
+        getattr(forward_batch, "global_num_tokens_cpu", None),
+        getattr(forward_batch, "original_global_num_tokens_cpu", None),
+    )
+
+
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their
     # tensor layout assumptions, so keep it disabled when either dependency is off.
@@ -520,11 +671,26 @@ class MQALayer(nn.Module):
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
+        x: Optional[torch.Tensor] = None,
+        stage: str = "unknown",
     ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
+        q_lora = q
+        q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if q_out is None:
             q_out = torch.empty_like(q)
+        if forward_batch is not None and q.shape[0] != positions.numel():
+            _log_dsv4_position_mismatch(
+                layer_id=self.layer_id,
+                stage=stage,
+                q_tokens=q.shape[0],
+                positions=positions,
+                forward_batch=forward_batch,
+                x=q if x is None else x,
+                q_lora=q_lora,
+                q_out=q_out,
+            )
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
@@ -638,7 +804,14 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q = self._compute_q_b(
+            q_lora,
+            positions,
+            q_out,
+            forward_batch=forward_batch,
+            x=x,
+            stage="multi_stream",
+        )
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
@@ -735,7 +908,14 @@ class MQALayer(nn.Module):
             )
         else:
             q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            q = self._compute_q_b(
+                q_lora,
+                positions,
+                q_out,
+                forward_batch=forward_batch,
+                x=x,
+                stage="multi_stream_hip",
+            )
             self._compute_kv_to_cache(
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
@@ -836,7 +1016,14 @@ class MQALayer(nn.Module):
                 )
         else:
             q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            q = self._compute_q_b(
+                q_lora,
+                positions,
+                q_out,
+                forward_batch=forward_batch,
+                x=x,
+                stage="normal",
+            )
             if use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -1358,6 +1545,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
+        _log_dsv4_layer_token_mismatch(
+            layer_id=self.layer_id,
+            stage="layer_entry",
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            use_fused=use_fused,
+        )
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = mhc_fused_post_pre(
@@ -1403,11 +1600,33 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
+        _log_dsv4_layer_token_mismatch(
+            layer_id=self.layer_id,
+            stage="before_attn",
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            use_fused=use_fused,
+        )
+
         hidden_states = self.self_attn(
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
+        )
+
+        _log_dsv4_layer_token_mismatch(
+            layer_id=self.layer_id,
+            stage="after_attn",
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            use_fused=use_fused,
         )
 
         if use_fused:
@@ -1475,6 +1694,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_attention_tp_size() > 1
             and not get_moe_a2a_backend().is_none()
         )
+        _log_dsv4_layer_token_mismatch(
+            layer_id=self.layer_id,
+            stage="before_mlp_sync",
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            use_fused=use_fused,
+            use_cp=_use_cp,
+            use_tp_moe_gather=_use_tp_moe_gather,
+            use_tp_attn_a2a_scatter=_use_tp_attn_a2a_scatter,
+        )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
@@ -1489,6 +1721,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+        _log_dsv4_layer_token_mismatch(
+            layer_id=self.layer_id,
+            stage="after_mlp_gather",
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            use_fused=use_fused,
+            use_cp=_use_cp,
+            use_tp_moe_gather=_use_tp_moe_gather,
+            use_tp_attn_a2a_scatter=_use_tp_attn_a2a_scatter,
+        )
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
@@ -1496,12 +1741,38 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+        _log_dsv4_layer_token_mismatch(
+            layer_id=self.layer_id,
+            stage="before_mlp",
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            use_fused=use_fused,
+            use_cp=_use_cp,
+            use_tp_moe_gather=_use_tp_moe_gather,
+            use_tp_attn_a2a_scatter=_use_tp_attn_a2a_scatter,
+        )
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
             use_reduce_scatter=_use_cp,
+        )
+        _log_dsv4_layer_token_mismatch(
+            layer_id=self.layer_id,
+            stage="after_mlp",
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            use_fused=use_fused,
+            use_cp=_use_cp,
+            use_tp_moe_gather=_use_tp_moe_gather,
+            use_tp_attn_a2a_scatter=_use_tp_attn_a2a_scatter,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
@@ -1523,6 +1794,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
+
+        _log_dsv4_layer_token_mismatch(
+            layer_id=self.layer_id,
+            stage="layer_exit",
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            use_fused=use_fused,
+            use_cp=_use_cp,
+            use_tp_moe_gather=_use_tp_moe_gather,
+            use_tp_attn_a2a_scatter=_use_tp_attn_a2a_scatter,
+        )
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
@@ -1641,6 +1926,14 @@ class DeepseekV4Model(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
+            if hidden_states.shape[0] != input_ids.numel():
+                _log_dsv4_pp_proxy_mismatch(
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
