@@ -79,7 +79,14 @@ class DeepseekModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
+        if quant_config is not None and quant_config.get_name() == "w4afp8":
+            # W4AFP8 checkpoints keep the NextN/MTP MoE weights in the original
+            # FP8 format, while the target model's routed experts are INT4-FP8.
+            moe_quant_config_override = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        elif enable_nextn_moe_bf16_cast_to_fp8(quant_config):
             # refer to real DeepSeek V3 quant config
             moe_quant_config_override = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
