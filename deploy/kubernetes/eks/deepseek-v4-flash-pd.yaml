@@ -1,0 +1,774 @@
+# DeepSeek-V4-Flash on Amazon EKS
+#
+# Architecture:
+#   AWS NLB -> SGLang Model Gateway / SMG (2+ replicas)
+#           -> consistently hashed Prefill pool (2 x 4 B200)
+#           -> consistently hashed Decode pool  (2 x 4 B200)
+#
+# Assumptions / prerequisites:
+#   * An EKS cluster with at least two p6-b200.48xlarge GPU nodes.
+#   * NVIDIA device plugin installed and advertising nvidia.com/gpu.
+#   * AWS EBS CSI driver installed (for the gp3 model-cache volumes).
+#   * AWS Load Balancer Controller installed (the NLB defaults to internal).
+#   * Worker nodes can reach Hugging Face, or the model is already cached.
+#   * Replace HF_TOKEN below before applying this file.
+#
+# Apply:
+#   kubectl apply -f deploy/kubernetes/eks/deepseek-v4-flash-pd.yaml
+#
+# KV-cache affinity:
+#   * All SMG replicas use the same consistent hash ring for P/D selection.
+#   * Send X-SMG-Routing-Key with a stable prompt/template or conversation key.
+#   * Decode-side radix cache avoids retransferring an already-cached prefix.
+#
+# This recipe intentionally does not enable EAGLE/MTP speculative decoding:
+# --disaggregation-decode-enable-radix-cache is incompatible with speculative
+# decoding in SGLang. This manifest prioritizes KV-cache reuse.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: deepseek-v4
+  labels:
+    app.kubernetes.io/part-of: deepseek-v4-flash
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: deepseek-v4-gp3
+  labels:
+    app.kubernetes.io/part-of: deepseek-v4-flash
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  iops: "12000"
+  throughput: "1000"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Replace this placeholder in the file before applying. Alternatively, delete
+# this Secret document and create hf-credentials out of band (External Secrets,
+# Sealed Secrets, or kubectl) before applying the remaining resources.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-credentials
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/part-of: deepseek-v4-flash
+type: Opaque
+stringData:
+  HF_TOKEN: "REPLACE_WITH_A_HUGGING_FACE_TOKEN"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sgl-model-gateway
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: sgl-model-gateway
+    app.kubernetes.io/part-of: deepseek-v4-flash
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: smg-pod-discovery
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: sgl-model-gateway
+    app.kubernetes.io/part-of: deepseek-v4-flash
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: smg-pod-discovery
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: sgl-model-gateway
+    app.kubernetes.io/part-of: deepseek-v4-flash
+subjects:
+  - kind: ServiceAccount
+    name: sgl-model-gateway
+    namespace: deepseek-v4
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: smg-pod-discovery
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek-v4-smg
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: sgl-model-gateway
+    app.kubernetes.io/instance: deepseek-v4-flash
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: deepseek-v4-flash
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sgl-model-gateway
+      app.kubernetes.io/instance: deepseek-v4-flash
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sgl-model-gateway
+        app.kubernetes.io/instance: deepseek-v4-flash
+        app.kubernetes.io/component: gateway
+        app.kubernetes.io/part-of: deepseek-v4-flash
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "29000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: sgl-model-gateway
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: sgl-model-gateway
+                    app.kubernetes.io/instance: deepseek-v4-flash
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: sgl-model-gateway
+              app.kubernetes.io/instance: deepseek-v4-flash
+      containers:
+        - name: smg
+          # Pin to a tested digest in production.
+          image: lmsysorg/sgl-model-gateway:v0.3.2
+          imagePullPolicy: IfNotPresent
+          command: ["smg", "launch"]
+          args:
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "30000"
+            - --pd-disaggregation
+            - --service-discovery
+            - --service-discovery-namespace
+            - deepseek-v4
+            - --service-discovery-port
+            - "30000"
+            - --prefill-selector
+            - app.kubernetes.io/name=deepseek-v4-flash
+            - sglang.ai/role=prefill
+            - --decode-selector
+            - app.kubernetes.io/name=deepseek-v4-flash
+            - sglang.ai/role=decode
+            # Deterministic across independent SMG replicas. Clients should send
+            # X-SMG-Routing-Key with a stable prompt/template or conversation key.
+            - --policy
+            - consistent_hashing
+            - --prefill-policy
+            - consistent_hashing
+            - --decode-policy
+            - consistent_hashing
+            - --worker-startup-timeout-secs
+            - "14400"
+            - --worker-startup-check-interval
+            - "15"
+            - --request-timeout-secs
+            - "3600"
+            - --shutdown-grace-period-secs
+            - "240"
+            - --prometheus-host
+            - "0.0.0.0"
+            - --prometheus-port
+            - "29000"
+            - --request-id-headers
+            - x-request-id
+            - traceparent
+          env:
+            - name: RUST_LOG
+              value: "info"
+          ports:
+            - name: http
+              containerPort: 30000
+              protocol: TCP
+            - name: metrics
+              containerPort: 29000
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health_generate
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: deepseek-v4-smg
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: sgl-model-gateway
+    app.kubernetes.io/part-of: deepseek-v4-flash
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sgl-model-gateway
+      app.kubernetes.io/instance: deepseek-v4-flash
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: deepseek-v4-smg
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: sgl-model-gateway
+    app.kubernetes.io/part-of: deepseek-v4-flash
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: deepseek-v4-smg
+  minReplicas: 2
+  maxReplicas: 4
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 900
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+---
+# Internal Services are useful for direct health/metrics inspection. SMG
+# discovers individual Pod IPs through the Kubernetes API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek-v4-prefill
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: deepseek-v4-flash
+    app.kubernetes.io/component: prefill
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: deepseek-v4-flash
+    sglang.ai/role: prefill
+  ports:
+    - name: http
+      port: 30000
+      targetPort: http
+    - name: bootstrap
+      port: 8998
+      targetPort: bootstrap
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek-v4-decode
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: deepseek-v4-flash
+    app.kubernetes.io/component: decode
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: deepseek-v4-flash
+    sglang.ai/role: decode
+  ports:
+    - name: http
+      port: 30000
+      targetPort: http
+---
+# Prefill workers: 2 replicas x 4 B200 GPUs.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: deepseek-v4-prefill
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: deepseek-v4-flash
+    app.kubernetes.io/component: prefill
+    app.kubernetes.io/part-of: deepseek-v4-flash
+spec:
+  serviceName: deepseek-v4-prefill
+  replicas: 2
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: deepseek-v4-flash
+      sglang.ai/role: prefill
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: deepseek-v4-flash
+        app.kubernetes.io/instance: deepseek-v4-flash
+        app.kubernetes.io/component: prefill
+        app.kubernetes.io/part-of: deepseek-v4-flash
+        sglang.ai/role: prefill
+      annotations:
+        sglang.ai/bootstrap-port: "8998"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "30000"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: deepseek-v4-flash
+              sglang.ai/role: prefill
+      initContainers:
+        - name: validate-hf-token
+          image: public.ecr.aws/docker/library/busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              test -n "${HF_TOKEN}"
+              test "${HF_TOKEN}" != "REPLACE_WITH_A_HUGGING_FACE_TOKEN"
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-credentials
+                  key: HF_TOKEN
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      containers:
+        - name: sglang
+          # Pin to a tested release/digest once the V4-Flash image is selected.
+          image: lmsysorg/sglang:latest
+          imagePullPolicy: Always
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path
+            - deepseek-ai/DeepSeek-V4-Flash
+            - --served-model-name
+            - deepseek-ai/DeepSeek-V4-Flash
+            - --trust-remote-code
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "30000"
+            - --tp
+            - "4"
+            - --moe-runner-backend
+            - flashinfer_mxfp4
+            - --chunked-prefill-size
+            - "4096"
+            - --disable-flashinfer-autotune
+            - --swa-full-tokens-ratio
+            - "0.1"
+            - --reasoning-parser
+            - deepseek-v4
+            - --tool-call-parser
+            - deepseekv4
+            - --disaggregation-mode
+            - prefill
+            - --disaggregation-transfer-backend
+            - mooncake_tcp
+            - --disaggregation-bootstrap-port
+            - "8998"
+            - --enable-metrics
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-credentials
+                  key: HF_TOKEN
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface
+            - name: NCCL_DEBUG
+              value: WARN
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 30000
+              protocol: TCP
+            - name: bootstrap
+              containerPort: 8998
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add: ["IPC_LOCK"]
+          resources:
+            requests:
+              cpu: "48"
+              memory: 512Gi
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "96"
+              memory: 1024Gi
+              nvidia.com/gpu: "4"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 1440
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: model-cache
+        labels:
+          app.kubernetes.io/name: deepseek-v4-flash
+          app.kubernetes.io/component: prefill
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: deepseek-v4-gp3
+        resources:
+          requests:
+            storage: 1Ti
+---
+# Decode workers: 2 replicas x 4 B200 GPUs.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: deepseek-v4-decode
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: deepseek-v4-flash
+    app.kubernetes.io/component: decode
+    app.kubernetes.io/part-of: deepseek-v4-flash
+spec:
+  serviceName: deepseek-v4-decode
+  replicas: 2
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: deepseek-v4-flash
+      sglang.ai/role: decode
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: deepseek-v4-flash
+        app.kubernetes.io/instance: deepseek-v4-flash
+        app.kubernetes.io/component: decode
+        app.kubernetes.io/part-of: deepseek-v4-flash
+        sglang.ai/role: decode
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "30000"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: deepseek-v4-flash
+              sglang.ai/role: decode
+      initContainers:
+        - name: validate-hf-token
+          image: public.ecr.aws/docker/library/busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              test -n "${HF_TOKEN}"
+              test "${HF_TOKEN}" != "REPLACE_WITH_A_HUGGING_FACE_TOKEN"
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-credentials
+                  key: HF_TOKEN
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      containers:
+        - name: sglang
+          # Keep this image identical to the prefill image.
+          image: lmsysorg/sglang:latest
+          imagePullPolicy: Always
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path
+            - deepseek-ai/DeepSeek-V4-Flash
+            - --served-model-name
+            - deepseek-ai/DeepSeek-V4-Flash
+            - --trust-remote-code
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "30000"
+            - --tp
+            - "4"
+            - --moe-runner-backend
+            - flashinfer_mxfp4
+            - --chunked-prefill-size
+            - "4096"
+            - --disable-flashinfer-autotune
+            - --swa-full-tokens-ratio
+            - "0.1"
+            - --reasoning-parser
+            - deepseek-v4
+            - --tool-call-parser
+            - deepseekv4
+            - --disaggregation-mode
+            - decode
+            - --disaggregation-transfer-backend
+            - mooncake_tcp
+            - --disaggregation-decode-enable-radix-cache
+            - --mem-fraction-static
+            - "0.88"
+            - --enable-metrics
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-credentials
+                  key: HF_TOKEN
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface
+            - name: NCCL_DEBUG
+              value: WARN
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 30000
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add: ["IPC_LOCK"]
+          resources:
+            requests:
+              cpu: "48"
+              memory: 512Gi
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "96"
+              memory: 1024Gi
+              nvidia.com/gpu: "4"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 1440
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: model-cache
+        labels:
+          app.kubernetes.io/name: deepseek-v4-flash
+          app.kubernetes.io/component: decode
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: deepseek-v4-gp3
+        resources:
+          requests:
+            storage: 1Ti
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: deepseek-v4-prefill
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: deepseek-v4-flash
+    app.kubernetes.io/component: prefill
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: deepseek-v4-flash
+      sglang.ai/role: prefill
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: deepseek-v4-decode
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: deepseek-v4-flash
+    app.kubernetes.io/component: decode
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: deepseek-v4-flash
+      sglang.ai/role: decode
+---
+# SMG is the model gateway. The AWS NLB distributes connections across ready
+# replicas; deterministic worker hashing preserves affinity across replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek-v4-smg
+  namespace: deepseek-v4
+  labels:
+    app.kubernetes.io/name: sgl-model-gateway
+    app.kubernetes.io/instance: deepseek-v4-flash
+    app.kubernetes.io/part-of: deepseek-v4-flash
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    # Safe default: private NLB. Change to internet-facing only after enabling
+    # SMG API-key/TLS authentication or placing an authenticated gateway ahead.
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: traffic-port
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+  selector:
+    app.kubernetes.io/name: sgl-model-gateway
+    app.kubernetes.io/instance: deepseek-v4-flash
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
