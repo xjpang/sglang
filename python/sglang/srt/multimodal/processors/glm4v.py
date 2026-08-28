@@ -398,6 +398,15 @@ def glm_sample_and_decode_sync(vr, video_config=None):
     return frames, _glm_video_metadata(len(vr), fps, duration, indices)
 
 
+def _collapse_consecutive_token_ids(input_ids: list[int], token_id: int) -> list[int]:
+    """Collapse processor-expanded placeholder spans back to one token."""
+    return [
+        current
+        for index, current in enumerate(input_ids)
+        if current != token_id or index == 0 or input_ids[index - 1] != token_id
+    ]
+
+
 class Glm4vImageProcessor(SGLangBaseProcessor):
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
@@ -476,7 +485,16 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        # Bare base64 video must use SGLang's decoder because HF treats it as a path-like string.
+        # RL clients can send the processor-expanded input IDs together with
+        # the original images. Collapse each image-token span before media
+        # loading so one image is not interpreted as N separate placeholders;
+        # process_and_combine_mm_data will expand it to the same span again.
+        if isinstance(input_text, list):
+            input_text = _collapse_consecutive_token_ids(input_text, self.IM_TOKEN_ID)
+
+        # Normalize inline media dictionaries before loading. In particular, a
+        # bare base64 video must go through SGLang's decoder rather than being
+        # forwarded to the HF video loader as a path-like string.
         video_urls, video_configs = split_glm_video_items(request_obj.video_data)
         video_processor = getattr(self._processor, "video_processor", None)
         default_video_config = glm_processor_video_config(video_processor)
