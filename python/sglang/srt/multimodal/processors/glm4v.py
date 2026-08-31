@@ -7,9 +7,20 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
+from sglang.srt.multimodal.media_artifacts import (
+    MediaArtifactCacheMixin,
+    MediaArtifactInput,
+)
+from sglang.srt.multimodal.media_artifacts.glm5_next import (
+    Glm5NextImagePreprocessArtifact,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -411,9 +422,10 @@ def _collapse_glm5_next_image_tokens(
     ]
 
 
-class Glm4vImageProcessor(SGLangBaseProcessor):
+class Glm4vImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
+    artifact_modality = Modality.IMAGE
     models = [
         m
         for m in [
@@ -426,6 +438,18 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        if hf_config.model_type == "glm5_next":
+            # GLM-5.3 can produce tens of thousands of image patches per
+            # request.  Keep that CPU/GPU preprocessing off the tokenizer
+            # manager's asyncio thread and allow independent requests to make
+            # progress while a large image is being prepared.
+            self.auto_mm_processor_worker_num = 2
+            self.auto_mm_io_worker_num = 16
+            # Match vLLM's processed-input cache policy. The budget is split
+            # across tokenizer workers by BaseMultimodalProcessor.
+            self.auto_mm_preprocess_cache_size_mb = 4096
+            self.supports_mm_processor_concurrency = True
+            self.precompute_hash_before_cpu_transfer = True
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         # GLM-V specific tokens
@@ -458,6 +482,128 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+    def prepare_artifact_batch(
+        self,
+        entries: List[MediaArtifactInput],
+        *,
+        processor=None,
+    ) -> List[Glm5NextImagePreprocessArtifact]:
+        """Preprocess image cache misses without involving prompt tokenization."""
+        processor = processor or self._processor
+        image_processor = processor.image_processor
+        image_kwargs = dict(self.image_config)
+        processor_device = None
+        if not self.disable_fast_image_processor:
+            processor_device = self._fast_image_processor_device(processor)
+            if processor_device is not None:
+                image_kwargs["device"] = processor_device
+
+        with self._temporary_fast_processor_cuda_pool(processor_device):
+            output = image_processor(
+                images=[entry.media for entry in entries],
+                return_tensors="pt",
+                **image_kwargs,
+            )
+            features = output["pixel_values"]
+            grids = output["image_grid_thw"]
+            if not self.keep_mm_features_on_device and features.device.type != "cpu":
+                features = features.cpu()
+
+        patch_counts = [int(grid.prod().item()) for grid in grids]
+        if sum(patch_counts) != features.shape[0]:
+            raise ValueError(
+                "GLM-5.3 image grids do not align with the processed patch tensor"
+            )
+
+        artifacts = []
+        feature_start = 0
+        for entry, grid, patch_count in zip(entries, grids, patch_counts):
+            feature_end = feature_start + patch_count
+            feature = features[feature_start:feature_end]
+            # The artifact key is already a SHA-256 digest over media contents,
+            # model revision and every preprocessing option. Use its first
+            # 64 bits as the downstream embedding-cache identity instead of
+            # hashing a patch tensor that can exceed 100 MiB.
+            feature_hash = int(entry.artifact_key.removeprefix("sha256:")[:16], 16)
+            artifacts.append(
+                Glm5NextImagePreprocessArtifact(
+                    content_digest=entry.content_digest,
+                    artifact_key=entry.artifact_key,
+                    feature_hash=feature_hash,
+                    grid_thw=tuple(int(value) for value in grid.tolist()),
+                    feature=feature,
+                )
+            )
+            feature_start = feature_end
+        return artifacts
+
+    def _tokenize_glm5_next_prompt(self, input_text) -> torch.Tensor:
+        if isinstance(input_text, torch.Tensor):
+            return input_text.flatten().to(dtype=torch.long)
+        if isinstance(input_text, list):
+            return torch.tensor(input_text, dtype=torch.long)
+
+        tokenizer_kwargs = {"return_tensors": "pt", "add_special_tokens": True}
+        bos = getattr(self._tokenizer, "bos_token", None)
+        if self._tokenizer_auto_adds_specials and bos and input_text.startswith(bos):
+            tokenizer_kwargs["add_special_tokens"] = False
+        return self._tokenizer(input_text, **tokenizer_kwargs).input_ids.flatten()
+
+    def compose_glm5_next_image_request(
+        self,
+        input_text,
+        artifacts: List[Glm5NextImagePreprocessArtifact],
+    ) -> MultimodalProcessorOutput:
+        """Combine cached image artifacts with this request's exact prompt."""
+        prompt_ids = self._tokenize_glm5_next_prompt(input_text)
+        image_token_counts = [
+            math.prod(artifact.grid_thw) // (self.spatial_merge_size**2)
+            for artifact in artifacts
+        ]
+        input_ids = torch.tensor(
+            self._expand_input_ids(
+                prompt_ids.tolist(),
+                image_token_counts,
+                self.IM_TOKEN_ID,
+            ),
+            dtype=torch.long,
+        )
+        offsets = self.get_mm_items_offset(input_ids, self.IM_TOKEN_ID)
+        if len(offsets) != len(artifacts):
+            raise ValueError("Expected one GLM-5.3 image span for each image")
+
+        mm_items = []
+        grids = []
+        for artifact, offset in zip(artifacts, offsets):
+            grid = torch.tensor([artifact.grid_thw], dtype=torch.long)
+            grids.append(grid)
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=artifact.feature,
+                offsets=[offset],
+                model_specific_data={"image_grid_thw": grid},
+            )
+            item.set_hash(artifact.feature_hash)
+            mm_items.append(item)
+
+        mm_items = self._prepare_mm_items_for_transport(mm_items)
+        image_grid_thw = torch.cat(grids, dim=0) if grids else None
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids.unsqueeze(0),
+            hf_config=self.hf_config,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=None,
+            attention_mask=None,
+        )
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            mrope_positions=mrope_positions.squeeze(1),
+            mrope_position_delta=mrope_position_delta,
+        )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         image_grid_thw = None
@@ -495,6 +641,30 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         # process_and_combine_mm_data will expand it to the same span again.
         if self.hf_config.model_type == "glm5_next" and isinstance(input_text, list):
             input_text = _collapse_glm5_next_image_tokens(input_text, self.IM_TOKEN_ID)
+
+        # vLLM caches processor outputs by media identity. Do the same for the
+        # common image-only GLM-5.3 path: cache misses preprocess only the
+        # missing images, while hits skip decode, resize, normalization and
+        # patchification. Video and preprocessed-input compatibility paths keep
+        # using the full HF processor below.
+        if (
+            self.hf_config.model_type == "glm5_next"
+            and image_data
+            and not request_obj.video_data
+            and not self.skip_tokenizer_init
+            and not self.keep_mm_features_on_device
+            and self.mm_preprocess_cache.enabled
+            and not any(self._is_preprocessed_input(item) for item in image_data)
+            and not any(
+                isinstance(item, str) and item.startswith("video:")
+                for item in image_data
+            )
+        ):
+            artifacts = await self.prepare_media_artifacts(
+                image_data,
+                content_hashes=getattr(request_obj, "mm_content_hashes", None),
+            )
+            return self.compose_glm5_next_image_request(input_text, artifacts)
 
         # Normalize inline media dictionaries before loading. In particular, a
         # bare base64 video must go through SGLang's decoder rather than being
@@ -572,7 +742,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 processor_video_config.update(videos_kwargs)
             combine_kwargs["processor_video_config"] = processor_video_config
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens, **combine_kwargs
         )
 

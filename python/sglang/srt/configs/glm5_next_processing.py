@@ -34,7 +34,10 @@ from transformers.image_utils import (
     PILImageResampling,
     SizeDict,
 )
-from transformers.models.glm46v.processing_glm46v import Glm46VProcessor
+from transformers.models.glm46v.processing_glm46v import (
+    Glm46VProcessor,
+    Glm46VProcessorKwargs,
+)
 from transformers.models.glm46v.video_processing_glm46v import (
     Glm46VVideoProcessor,
 )
@@ -322,8 +325,122 @@ class Glm5NextImageProcessor(TorchvisionBackend):
         return (resized_height // patch_size) * (resized_width // patch_size)
 
 
+def expand_glm5_next_image_token_ids(
+    input_ids: list[list[int]],
+    attention_mask: list[list[int]] | None,
+    image_token_id: int,
+    image_token_counts: list[int],
+) -> tuple[list[list[int]], list[list[int]] | None]:
+    """Expand image placeholders directly in token space.
+
+    The inherited GLM-4.6 processor builds a string containing thousands of
+    image markers and sends it through the tokenizer again. GLM-5.3 already
+    has an unambiguous single-token image marker, so expanding its token ID is
+    equivalent and avoids constructing and tokenizing that large string.
+    """
+    expanded_ids = []
+    expanded_masks = [] if attention_mask is not None else None
+    image_index = 0
+
+    for row_index, row in enumerate(input_ids):
+        row_mask = attention_mask[row_index] if attention_mask is not None else None
+        if row_mask is not None and len(row_mask) != len(row):
+            raise ValueError("attention_mask must align with input_ids")
+
+        output_row = []
+        output_mask = [] if row_mask is not None else None
+        for token_index, token_id in enumerate(row):
+            repeat = 1
+            if token_id == image_token_id:
+                if image_index >= len(image_token_counts):
+                    raise ValueError(
+                        "Prompt contains more image placeholders than input images"
+                    )
+                repeat = image_token_counts[image_index]
+                image_index += 1
+            output_row.extend([token_id] * repeat)
+            if output_mask is not None:
+                output_mask.extend([row_mask[token_index]] * repeat)
+        expanded_ids.append(output_row)
+        if expanded_masks is not None:
+            expanded_masks.append(output_mask)
+
+    if image_index != len(image_token_counts):
+        raise ValueError(
+            f"Prompt contains {image_index} image placeholder(s), but "
+            f"{len(image_token_counts)} image(s) were provided"
+        )
+    return expanded_ids, expanded_masks
+
+
+class Glm5NextProcessorKwargs(Glm46VProcessorKwargs, total=False):
+    _defaults = {
+        "text_kwargs": {
+            "padding": False,
+            "return_token_type_ids": False,
+            # SGLang derives modality from the image-token offsets, so building
+            # a second sequence-sized mask here is unnecessary.
+            "return_mm_token_type_ids": False,
+        },
+        "videos_kwargs": {"return_metadata": True},
+    }
+
+
 class Glm5NextProcessor(Glm46VProcessor):
     """Build GLM-5.3's image processor on the pinned Transformers version."""
+
+    def __call__(self, images=None, text=None, videos=None, **kwargs):
+        # Keep the upstream video path because it also inserts per-frame
+        # timestamps. The image-only path can expand placeholders directly in
+        # token space, matching vLLM's prompt-update strategy.
+        if videos is not None:
+            return super().__call__(images=images, text=text, videos=videos, **kwargs)
+
+        output_kwargs = self._merge_kwargs(
+            Glm5NextProcessorKwargs,
+            tokenizer_init_kwargs=self.tokenizer.init_kwargs,
+            **kwargs,
+        )
+        if images is not None:
+            image_inputs = self.image_processor(
+                images=images, **output_kwargs["images_kwargs"]
+            )
+            merge_length = self.image_processor.merge_size**2
+            image_token_counts = [
+                int(grid.prod().item()) // merge_length
+                for grid in image_inputs["image_grid_thw"]
+            ]
+        else:
+            image_inputs = {}
+            image_token_counts = []
+
+        if not isinstance(text, list):
+            text = [text]
+        return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
+        return_mm_token_type_ids = output_kwargs["text_kwargs"].pop(
+            "return_mm_token_type_ids", False
+        )
+        text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
+
+        if image_token_counts:
+            input_ids, attention_mask = expand_glm5_next_image_token_ids(
+                text_inputs["input_ids"],
+                text_inputs.get("attention_mask"),
+                self.image_token_id,
+                image_token_counts,
+            )
+            text_inputs["input_ids"] = input_ids
+            if attention_mask is not None:
+                text_inputs["attention_mask"] = attention_mask
+
+        if return_mm_token_type_ids:
+            text_inputs["mm_token_type_ids"] = [
+                [int(token_id == self.image_token_id) for token_id in row]
+                for row in text_inputs["input_ids"]
+            ]
+        return BatchFeature(
+            data={**text_inputs, **image_inputs}, tensor_type=return_tensors
+        )
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
