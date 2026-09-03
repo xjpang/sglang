@@ -223,6 +223,11 @@ class BaseMultimodalProcessor(ABC):
     # `_resolve_auto_mm_processor_worker_num`.
     auto_mm_processor_worker_num = None
     auto_mm_io_worker_num = 4
+    # A single processor worker normally preserves the legacy synchronous path.
+    # Models whose preprocessing is long enough to stall TokenizerManager's
+    # asyncio loop can opt into an isolated one-thread executor without adding
+    # another concurrent producer of work for the serving GPU.
+    isolate_single_mm_processor_worker = False
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
@@ -350,7 +355,15 @@ class BaseMultimodalProcessor(ABC):
             )
             self.mm_processor_worker_num = 1
         self.mm_processor_executor = None
-        if self.mm_processor_worker_num > 1:
+        should_create_mm_processor_executor = not skip_mm_pool and (
+            self.mm_processor_worker_num > 1
+            or (
+                self.mm_processor_worker_num == 1
+                and self.isolate_single_mm_processor_worker
+                and self.supports_mm_processor_concurrency
+            )
+        )
+        if should_create_mm_processor_executor:
             try:
                 # A callable, not the object: subclasses finish customizing
                 # `_processor` after this returns, and the workers must clone it
@@ -367,8 +380,8 @@ class BaseMultimodalProcessor(ABC):
                 self.mm_processor_worker_num = 1
         if self.mm_processor_executor is not None:
             logger.info(
-                "Multimodal processor concurrency enabled with %d isolated "
-                "worker threads (%s).",
+                "Multimodal processor executor enabled with %d isolated "
+                "worker thread(s) (%s).",
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )

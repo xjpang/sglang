@@ -449,6 +449,14 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        if hf_config.model_type == "glm5_next":
+            # GLM-5.3 preprocessing is long enough that running the single GPU
+            # processor inline stalls TokenizerManager's asyncio loop, including
+            # delivery of tokens from requests that are already decoding. Keep
+            # GPU preprocessing serialized, but move it to one isolated worker.
+            self.isolate_single_mm_processor_worker = True
+            # Match the mature Qwen-VL path for bursty remote-media loading.
+            self.auto_mm_io_worker_num = 16
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         # GLM-V specific tokens
