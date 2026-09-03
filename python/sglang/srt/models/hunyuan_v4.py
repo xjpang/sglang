@@ -44,13 +44,12 @@ def _hpc_ihc_available(op_name: str, hc_mult: int, hidden_size: int) -> bool:
 
 
 def permute_hyv4_indexer_weight(name, loaded_weight, config):
-    if ".self_attn.indexer.wq_b." in name:
+    if name.endswith(".self_attn.indexer.wq_b.weight"):
         group_count = config.index_n_heads
-    elif any(
-        key in name
-        for key in (
-            ".self_attn.indexer.wk.",
-            ".self_attn.indexer.k_norm.",
+    elif name.endswith(
+        (
+            ".self_attn.indexer.wk.weight",
+            ".self_attn.indexer.k_norm.weight",
         )
     ):
         group_count = 1
@@ -138,8 +137,8 @@ class HYV4HCPreLayer(nn.Module):
         post = (
             self.magnitude
             * torch.sigmoid(
-                gates[..., self.hc_mult :] * self.hc_scale[1]
-                + self.hc_base[self.hc_mult :]
+                gates[..., self.hc_mult:] * self.hc_scale[1]
+                + self.hc_base[self.hc_mult:]
             )
             + self.hc_eps
         )
@@ -382,7 +381,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         parallel = get_parallel()
         heads = loaded_weight.shape[0] // parallel.attn_tp_size
         start = parallel.attn_tp_rank * heads
-        param.data.copy_(loaded_weight[start : start + heads].float())
+        param.data.copy_(loaded_weight[start: start + heads].float())
 
     @staticmethod
     def _resolve_gate_fallback_backend() -> str:
