@@ -1943,15 +1943,18 @@ class BaseMultimodalProcessor(ABC):
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
+        result_transform=None,
         **kwargs,
-    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
-        """Run multimodal preprocessing without blocking the event loop."""
+    ):
+        """Run multimodal preprocessing and optional finalization off the event loop."""
         if self.mm_processor_executor is None:
-            return self.process_and_combine_mm_data(base_output, mm_tokens, **kwargs)
+            result = self.process_and_combine_mm_data(base_output, mm_tokens, **kwargs)
+            return result if result_transform is None else result_transform(result)
 
         return await self.mm_processor_executor.run(
             self.process_and_combine_mm_data,
             base_output,
             mm_tokens,
+            result_transform=result_transform,
             **kwargs,
         )

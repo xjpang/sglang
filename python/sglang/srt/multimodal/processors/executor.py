@@ -5,6 +5,7 @@ import threading
 from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
+R = TypeVar("R")
 
 
 class _WorkerState(threading.local):
@@ -30,10 +31,17 @@ class MultimodalProcessorExecutor:
         self._worker_state = _WorkerState()
         self._clone_lock = threading.Lock()
 
-    async def run(self, function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    async def run(
+        self,
+        function: Callable[..., T],
+        *args: Any,
+        result_transform: Callable[[T], R] | None = None,
+        **kwargs: Any,
+    ) -> T | R:
+        """Run processing and its optional finalizer on the same worker thread."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._executor, self._run, function, args, kwargs
+            self._executor, self._run, function, args, kwargs, result_transform
         )
 
     def _run(
@@ -41,7 +49,8 @@ class MultimodalProcessorExecutor:
         function: Callable[..., T],
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> T:
+        result_transform: Callable[[T], R] | None,
+    ) -> T | R:
         processor = self._worker_state.processor
         if processor is None:
             # One clone at a time: cloning reads the shared processor, which the
@@ -49,7 +58,8 @@ class MultimodalProcessorExecutor:
             with self._clone_lock:
                 processor = copy.deepcopy(self._resolve_processor())
             self._worker_state.processor = processor
-        return function(*args, processor=processor, **kwargs)
+        result = function(*args, processor=processor, **kwargs)
+        return result if result_transform is None else result_transform(result)
 
     def shutdown(self) -> None:
         self._executor.shutdown()

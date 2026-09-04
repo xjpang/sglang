@@ -216,6 +216,25 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
 
+    def test_gpu_path_can_isolate_its_single_worker(self):
+        """Long preprocessing can leave the event loop without adding a second
+        producer of GPU work."""
+        from transformers import BaseImageProcessor
+
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "isolate_single_mm_processor_worker", True
+        ):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
+
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNotNone(proc.mm_processor_executor)
+
     def test_explicit_request_overrides_the_path_decision(self):
         """The server argument wins: an operator who measured their own workload
         can still ask for concurrency on the GPU path."""
@@ -274,6 +293,19 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         with patch.object(BaseMultimodalProcessor, "auto_mm_io_worker_num", 16):
             proc = self._make_processor({}, mm_io_worker_num=6)
         self.assertEqual(proc.mm_io_worker_num, 6)
+
+    def test_glm5_next_opts_into_isolated_qwen_sized_io_pool(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.processors.glm4v import Glm4vImageProcessor
+
+        hf_config = MagicMock(model_type="glm5_next")
+        with patch.object(BaseMultimodalProcessor, "__init__", return_value=None):
+            proc = Glm4vImageProcessor(hf_config, MagicMock(), MagicMock())
+
+        self.assertTrue(proc.isolate_single_mm_processor_worker)
+        self.assertEqual(proc.auto_mm_io_worker_num, 16)
 
 
 class TestMultimodalFeatureTransportRuntime(CustomTestCase):
@@ -605,6 +637,40 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
             processor.process_and_combine_mm_data.call_args.kwargs["marker"]
         )
 
+    async def test_result_transform_stays_on_processor_worker(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        with (
+            patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()),
+            patch.object(BaseMultimodalProcessor, "__init__", lambda self: None),
+        ):
+            processor = BaseMultimodalProcessor()
+
+        hf_processor = SimpleNamespace(tokenizer=object())
+        processor.mm_processor_executor = MultimodalProcessorExecutor(
+            lambda: hf_processor, max_workers=1
+        )
+        processor.process_and_combine_mm_data = MagicMock(return_value="processed")
+        try:
+            result = await processor.process_and_combine_mm_data_async(
+                MagicMock(),
+                MagicMock(),
+                result_transform=lambda value: (
+                    value,
+                    threading.current_thread().name,
+                ),
+            )
+        finally:
+            processor.mm_processor_executor.shutdown()
+
+        self.assertEqual(result[0], "processed")
+        self.assertTrue(result[1].startswith("sglang-mm-processor"))
+
     async def test_single_worker_preserves_synchronous_path(self):
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
@@ -625,6 +691,28 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "synchronous")
         processor.process_and_combine_mm_data.assert_called_once()
+
+    async def test_result_transform_runs_inline_without_executor(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with (
+            patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()),
+            patch.object(BaseMultimodalProcessor, "__init__", lambda self: None),
+        ):
+            processor = BaseMultimodalProcessor()
+
+        processor.mm_processor_executor = None
+        processor.process_and_combine_mm_data = MagicMock(return_value="processed")
+
+        result = await processor.process_and_combine_mm_data_async(
+            MagicMock(),
+            MagicMock(),
+            result_transform=lambda value: f"{value}-finalized",
+        )
+
+        self.assertEqual(result, "processed-finalized")
 
     async def test_worker_reuses_precreated_private_processor_clone(self):
         from sglang.srt.multimodal.processors.executor import (

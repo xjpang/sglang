@@ -450,10 +450,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         if hf_config.model_type == "glm5_next":
-            # GLM-5.3 preprocessing is long enough that running the single GPU
-            # processor inline stalls TokenizerManager's asyncio loop, including
-            # delivery of tokens from requests that are already decoding. Keep
-            # GPU preprocessing serialized, but move it to one isolated worker.
+            # The fast image processor makes the automatic policy retain one
+            # worker so it cannot compete with inference on the serving GPU.
+            # GLM-5.3 video processing is CPU-bound but inherits that one-worker
+            # decision; isolate it so a long video cannot stall TokenizerManager's
+            # asyncio loop or token delivery for requests already decoding.
             self.isolate_single_mm_processor_worker = True
             # Match the mature Qwen-VL path for bursty remote-media loading.
             self.auto_mm_io_worker_num = 16
@@ -489,6 +490,28 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+    def _finalize_processor_output(self, processor_output):
+        """Finish GLM request metadata on the processor worker when available."""
+        mm_items, input_ids, ret = processor_output
+        input_ids = input_ids.flatten()
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids.unsqueeze(0),
+            hf_config=self.hf_config,
+            image_grid_thw=getattr(ret, "image_grid_thw", None),
+            video_grid_thw=getattr(ret, "video_grid_thw", None),
+            attention_mask=getattr(ret, "attention_mask", None),
+        )
+        mrope_positions = mrope_positions.squeeze(1)
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         image_grid_thw = None
@@ -605,25 +628,9 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 processor_video_config.update(videos_kwargs)
             combine_kwargs["processor_video_config"] = processor_video_config
 
-        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
-            base_output, self.mm_tokens, **combine_kwargs
-        )
-
-        input_ids = input_ids.flatten()
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
-            input_ids=input_ids.unsqueeze(0),
-            hf_config=self.hf_config,
-            image_grid_thw=getattr(ret, "image_grid_thw", None),
-            video_grid_thw=getattr(ret, "video_grid_thw", None),
-            attention_mask=getattr(ret, "attention_mask", None),
-        )
-        mrope_positions = mrope_positions.squeeze(1)
-
-        return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
-            mm_items=mm_items,
-            im_token_id=self.mm_tokens.image_token_id,
-            video_token_id=self.mm_tokens.video_token_id,
-            mrope_positions=mrope_positions,
-            mrope_position_delta=mrope_position_delta,
+        return await self.process_and_combine_mm_data_async(
+            base_output,
+            self.mm_tokens,
+            result_transform=self._finalize_processor_output,
+            **combine_kwargs,
         )
